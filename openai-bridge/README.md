@@ -42,13 +42,28 @@ OPENAI_API_KEY  = anything-nonempty        # the gateway ignores it
 model           = <DirName>/<DirName>      # e.g. Qwen3.5-9B/Qwen3.5-9B
 ```
 
+## What is rewritten, and what is not
+
+| Request | Behaviour |
+|---|---|
+| no `tools` | passed through verbatim (including SSE streaming) |
+| `tool_choice: "auto"` / `"none"` | **passed through** — the gateway handles these natively |
+| `tool_choice: "required"`, one tool | emulated against that tool's schema |
+| `tool_choice: "required"`, several tools | emulated: the model picks one (`{"tool_name":…,"arguments":…}`), the answer is mapped back and validated against the offered names |
+| `tool_choice: {"function": {"name": …}}` | emulated against exactly that tool (unknown name → passthrough) |
+
+Emulated requests get `stream` removed (the answer must be buffered to be
+wrapped) and `max_tokens` clamped to `MAX_TOKENS` — a **hard cap**, larger
+client values are reduced.
+
 ## Ops notes
 
-- One log line per request (`docker logs llm-bridge`):
-  `[tool-emulation:Name,wrapped] -> 200 in 21.5s` is the healthy shape.
-  `wrap-failed:*` means the model answered non-JSON — the client gets a
-  normal error instead of a hang.
-- `MAX_TOKENS` (default 1024) caps generation as a safety net against the
-  infinite-generation failure modes of the stack.
-- Remember the gateway serializes per model (`-np 1`): parallel callers
-  queue. Plan batch jobs accordingly.
+- One log line per request (`docker logs llm-bridge`). Healthy:
+  `[emulate:DocumentClassifierSchema,wrapped] -> 200 in 21.5s`.
+  `[tools-passthrough]` means auto/none went straight to the gateway.
+  `wrap-failed:*` means the model answered non-JSON — the client then gets an
+  honest **HTTP 502**, never a silent bad result.
+- Requests larger than `MAX_BODY` (32 MiB) are rejected with 413.
+- The gateway serializes per model (`-np 1`): parallel callers queue.
+- Environment: `LISTEN_HOST`, `LISTEN_PORT`, `UPSTREAM`, `MAX_TOKENS`,
+  `TIMEOUT`, `MAX_BODY`.

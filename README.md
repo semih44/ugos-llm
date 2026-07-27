@@ -85,13 +85,37 @@ Details and how to qualify new models: [docs/compatibility.md](docs/compatibilit
 
 ## Safety
 
-- The only system-owned file this tool ever writes is the Model Manager catalog
-  DB (`--ui` flag only), and it **creates a timestamped backup first**.
-  Models themselves live in their own directories and are trivially removable.
-- Never `pkill` a UGOS llama-server. The gateway does not recover until reboot.
-  The CLI never does this and tells you the safe reload paths.
+This runs with root privileges on your NAS, so it is built defensively:
+
+- **No shell for privileged work.** File operations run either natively (as
+  root) or through pinned containers with explicit `argv` — never `sh -c`.
+- **Strict name validation.** Model names must match `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`,
+  so no path traversal, no metacharacters.
+- **Parameterised SQL only.** The Model Manager catalog is never touched by
+  string interpolation, and a **consistent backup** (SQLite backup API, so the
+  WAL is included) is written before every change.
+- **Vendor rows are untouchable.** Catalog rows created by this tool carry
+  `release_id = 9000`; `remove` refuses to delete anything else.
+- **Never `pkill`.** The gateway does not survive it (reboot required); the CLI
+  only ever prints the safe reload paths.
+- **Pinned images** (`alpine:3.20`, `python:3.12-alpine`) for privileged
+  helpers — no moving `latest` tags with write access to system data.
 - This project redistributes **no** UGREEN binaries, models or templates.
   Everything it touches on your NAS stays on your NAS.
+
+Known limitation: split/multi-shard GGUFs (`…-00001-of-00003.gguf`) are
+detected and **rejected** rather than half-installed. Pick a single-file quant.
+
+## Development
+
+```bash
+python3 -m unittest discover -s tests -v    # 28 unit tests, stdlib only
+```
+
+CI runs the suite on Python 3.9 and 3.12 plus a ruff lint. The risky parts —
+name validation, GGUF header parsing, architecture rules, split detection and
+the proxy's rewrite/wrap logic — are covered by tests; the NAS-facing parts are
+verified manually on hardware (see the version banner above).
 
 ## Disclaimer
 
