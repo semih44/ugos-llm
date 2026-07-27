@@ -46,7 +46,7 @@ UGOS first: Control Panel → Terminal.
 On the NAS (SSH session, user in the `docker` group — or root):
 
 ```bash
-curl -LO https://raw.githubusercontent.com/OWNER/ugos-llm/main/ugos-llm.py
+curl -LO https://raw.githubusercontent.com/semih44/ugos-llm/main/ugos-llm.py
 
 # 1. Pre-flight: is this model going to work?
 python3 ugos-llm.py check unsloth/Qwen3.5-9B-GGUF
