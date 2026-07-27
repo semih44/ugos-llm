@@ -316,6 +316,8 @@ class TestAtomicInstall(unittest.TestCase):
         self._orig_root = ug.is_root
         ug.MODELS_DIR = self.models
         ug.is_root = lambda: True          # exercise the native path
+        self._staging = ug._staging_dir
+        ug._staging_dir = lambda: self.tmp
         self.src = os.path.join(self.tmp, "src.gguf")
         with open(self.src, "wb") as f:
             f.write(b"GGUF" + b"\x00" * 32)
@@ -323,6 +325,7 @@ class TestAtomicInstall(unittest.TestCase):
     def tearDown(self):
         ug.MODELS_DIR = self._orig_dir
         ug.is_root = self._orig_root
+        ug._staging_dir = self._staging
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_installs_and_replaces(self):
@@ -374,6 +377,8 @@ class TestSwapFailures(unittest.TestCase):
                                                ug._priv_rename)
         ug.MODELS_DIR = self.models
         ug.is_root = lambda: True
+        self._staging = ug._staging_dir
+        ug._staging_dir = lambda: self.tmp
         self.src = os.path.join(self.tmp, "src.gguf")
         with open(self.src, "wb") as f:
             f.write(b"GGUF" + b"\x00" * 32)
@@ -382,6 +387,7 @@ class TestSwapFailures(unittest.TestCase):
     def tearDown(self):
         ug.MODELS_DIR, ug.is_root, ug._priv_rename = (self._dir, self._root,
                                                       self._rename)
+        ug._staging_dir = self._staging
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _config(self):
@@ -429,10 +435,44 @@ class TestSwapFailures(unittest.TestCase):
                           if d.startswith(".")], [])
 
     def test_concurrent_install_is_refused(self):
-        os.makedirs(os.path.join(self.models, ".M.lock"))
-        with self.assertRaises(SystemExit):
-            ug.priv_install_files("M", self.src, None, '{"v":"x"}')
+        import fcntl
+        lock_path = os.path.join(ug._staging_dir(), ".M.install.lock")
+        holder = open(lock_path, "w")
+        fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            with self.assertRaises(SystemExit):
+                ug.priv_install_files("M", self.src, None, '{"v":"x"}')
+        finally:
+            fcntl.flock(holder, fcntl.LOCK_UN)
+            holder.close()
         self.assertIn("old", self._config())   # untouched
+
+    def test_recovers_after_crash_that_left_a_lock_file(self):
+        """A real crash leaves the lock file behind. The kernel drops the
+        lock itself, so the next run must recover instead of refusing."""
+        os.rename(os.path.join(self.models, "M"),
+                  os.path.join(self.models, ".M.old"))
+        os.makedirs(os.path.join(self.models, ".M.new"))
+        open(os.path.join(ug._staging_dir(), ".M.install.lock"), "w").close()
+        ug.priv_install_files("M", self.src, None, '{"v":"recovered"}')
+        self.assertIn("recovered", self._config())
+        self.assertEqual([d for d in os.listdir(self.models)
+                          if d.startswith(".")], [])
+
+    def test_activation_succeeds_even_if_old_cleanup_fails(self):
+        real = ug._priv_rmtree
+
+        def flaky(dirname):
+            if dirname == ".M.old":
+                raise ug.PrivError("simulated cleanup failure")
+            return real(dirname)
+
+        ug._priv_rmtree = flaky
+        try:
+            ug.priv_install_files("M", self.src, None, '{"v":"new"}')
+        finally:
+            ug._priv_rmtree = real
+        self.assertIn("new", self._config(), "install must count as done")
 
     def test_data_files_are_not_executable(self):
         mode = os.stat(os.path.join(self.models, "M", "M.gguf")).st_mode

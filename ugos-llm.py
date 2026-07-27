@@ -24,6 +24,8 @@ License: MIT.
 """
 
 import argparse
+import contextlib
+import fcntl
 import io
 import json
 import os
@@ -164,19 +166,31 @@ def _priv_rename(src_name, dst_name):
                         f"{r.stderr.strip()[:200]}")
 
 
-def _priv_mkdir_exclusive(dirname):
-    """Create a directory, failing if it already exists (used as a lock)."""
-    if is_root():
+@contextlib.contextmanager
+def _install_lock(name):
+    """Advisory lock so two installs of the same model cannot interleave.
+
+    Deliberately an flock, not a lock directory: the kernel releases it when
+    the process dies (crash, power loss, SIGKILL), so a stale lock can never
+    block the crash recovery on the next run. The lock file itself is
+    allowed to persist; only the held lock matters. It lives in the staging
+    directory because that is writable without privileges.
+    """
+    path = os.path.join(_staging_dir(), f".{name}.install.lock")
+    fh = open(path, "w")
+    try:
         try:
-            os.mkdir(os.path.join(MODELS_DIR, dirname))
-            return True
-        except FileExistsError:
-            return False
-        except OSError as e:
-            raise PrivError(f"could not create {dirname}: {e}") from e
-    # busybox mkdir without -p fails when the directory exists
-    r = _docker(["mkdir", f"/m/{dirname}"], {MODELS_DIR: "/m"})
-    return r.returncode == 0
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            die(f"another install of {name!r} is already running "
+                f"(lock held on {path}). Wait for it to finish and retry.")
+        yield
+    finally:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+        except OSError:
+            pass          # never mask the real outcome
+        fh.close()
 
 
 def _recover_interrupted(name, work, old):
@@ -257,13 +271,8 @@ def priv_install_files(name, model_src, mmproj_src, config_json):
     validate_name(name)
     work = f".{name}.new"
     old = f".{name}.old"
-    lock = f".{name}.lock"
 
-    if not _priv_mkdir_exclusive(lock):
-        die(f"another install of {name!r} is in progress (lock directory "
-            f"{os.path.join(MODELS_DIR, lock)} exists). If no other install "
-            "is running, remove that directory and retry.")
-    try:
+    with _install_lock(name):
         _recover_interrupted(name, work, old)
         try:
             _priv_populate(work, name, model_src, mmproj_src, config_json)
@@ -294,9 +303,17 @@ def priv_install_files(name, model_src, mmproj_src, config_json):
                         f"{name} manually.") from e
             _priv_rmtree(work)
             raise PrivError(str(e)) from e
-        _priv_rmtree(old)
-    finally:
-        _priv_rmtree(lock)
+
+        # From here on the new model IS active. A failure while dropping the
+        # rollback copy must not be reported as a failed install — it only
+        # wastes disk until the next run cleans it up.
+        try:
+            _priv_rmtree(old)
+        except PrivError as e:
+            log(f"WARNING: the new model is active, but the previous "
+                f"installation could not be removed ({e}). It occupies disk "
+                f"at {os.path.join(MODELS_DIR, old)} and will be cleaned up "
+                "on the next install of this model.")
 
 
 def priv_remove_dir(name):
