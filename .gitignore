@@ -1,0 +1,3 @@
+.ugos-llm-staging/
+__pycache__/
+*.gguf

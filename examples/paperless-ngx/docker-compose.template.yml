@@ -1,0 +1,122 @@
+# Paperless-ngx on UGREEN NASync AI NAS — with AI suggestions powered by the
+# NAS-local LLM (no cloud, no extra Ollama container).
+#
+# Replace every CHANGE_ME. Suggested storage split on iDX6011-class devices:
+#   volume1 (ext4/NVMe):  db/, data/, redis/, consume/   <- write-heavy, no CoW
+#   volume2 (Btrfs/RAID): media/, export/                <- archive, checksummed
+# Adjust paths if your volumes differ.
+#
+# IMPORTANT: UGOS's Docker app reads docker-compose.yaml while the CLI reads
+# docker-compose.yml — if both exist, keep them identical.
+
+services:
+
+  broker:
+    image: docker.io/library/redis:7
+    container_name: paperless-broker
+    restart: unless-stopped
+    volumes:
+      - /volume1/docker/paperless/redis:/data
+
+  db:
+    image: docker.io/library/postgres:17
+    container_name: paperless-db
+    restart: unless-stopped
+    volumes:
+      - /volume1/docker/paperless/db:/var/lib/postgresql/data
+    environment:
+      POSTGRES_DB: paperless
+      POSTGRES_USER: paperless
+      POSTGRES_PASSWORD: CHANGE_ME_DB_PASSWORD
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U paperless"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  gotenberg:
+    image: docker.io/gotenberg/gotenberg:8
+    container_name: paperless-gotenberg
+    restart: unless-stopped
+    command:
+      - "gotenberg"
+      - "--chromium-disable-javascript=true"
+      - "--chromium-allow-list=file:///tmp/.*"
+
+  tika:
+    image: docker.io/apache/tika:latest
+    container_name: paperless-tika
+    restart: unless-stopped
+
+  # The openai-bridge (REQUIRED for AI suggestions): Paperless uses forced
+  # tool-calling, which the UGOS gateway cannot handle. See ../../openai-bridge/
+  llm-bridge:
+    image: docker.io/library/python:3.12-alpine
+    container_name: paperless-llm-bridge
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - /volume1/docker/paperless/bridge:/bridge:ro
+    command: ["python3", "/bridge/proxy.py"]
+
+  webserver:
+    image: ghcr.io/paperless-ngx/paperless-ngx:3.0.3
+    container_name: paperless-webserver
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      broker:
+        condition: service_started
+      gotenberg:
+        condition: service_started
+      tika:
+        condition: service_started
+    ports:
+      - "8000:8000"
+    volumes:
+      - /volume1/docker/paperless/data:/usr/src/paperless/data
+      - /volume1/docker/paperless/consume:/usr/src/paperless/consume
+      - /volume2/paperless/media:/usr/src/paperless/media
+      - /volume2/paperless/export:/usr/src/paperless/export
+    environment:
+      PAPERLESS_REDIS: redis://broker:6379
+      PAPERLESS_DBHOST: db
+      PAPERLESS_DBNAME: paperless
+      PAPERLESS_DBUSER: paperless
+      PAPERLESS_DBPASS: CHANGE_ME_DB_PASSWORD
+      PAPERLESS_TIKA_ENABLED: 1
+      PAPERLESS_TIKA_ENDPOINT: http://tika:9998
+      PAPERLESS_TIKA_GOTENBERG_ENDPOINT: http://gotenberg:3000
+
+      PAPERLESS_URL: http://CHANGE_ME_NAS_IP:8000
+      PAPERLESS_SECRET_KEY: "CHANGE_ME_RUN_openssl_rand_-base64_48"
+      PAPERLESS_TIME_ZONE: Europe/Berlin
+      PAPERLESS_OCR_LANGUAGE: deu+eng
+      PAPERLESS_OCR_LANGUAGES: deu eng
+      USERMAP_UID: 1000        # check with `id` on the NAS
+      USERMAP_GID: 10          # UGOS admin group
+
+      PAPERLESS_ADMIN_USER: CHANGE_ME
+      PAPERLESS_ADMIN_PASSWORD: CHANGE_ME
+      PAPERLESS_ADMIN_MAIL: CHANGE_ME@example.com
+
+      PAPERLESS_TASK_WORKERS: 3
+      PAPERLESS_THREADS_PER_WORKER: 2
+      PAPERLESS_CONSUMER_POLLING: 30   # inotify is unreliable on NAS shares
+
+      # ---- AI: local model via the openai-bridge ----
+      PAPERLESS_AI_ENABLED: "true"
+      PAPERLESS_AI_LLM_BACKEND: openai-like
+      PAPERLESS_AI_LLM_MODEL: CHANGE_ME_MODEL_ID   # e.g. Qwen3.5-9B/Qwen3.5-9B
+      PAPERLESS_AI_LLM_ENDPOINT: http://172.17.0.1:11434/v1
+      PAPERLESS_AI_LLM_API_KEY: local
+      PAPERLESS_AI_LLM_CONTEXT_SIZE: 16384
+      PAPERLESS_AI_LLM_REQUEST_TIMEOUT: 300
+      PAPERLESS_AI_LLM_OUTPUT_LANGUAGE: de         # doubles latency; drop if unwanted
+      PAPERLESS_AI_LLM_ALLOW_INTERNAL_ENDPOINTS: "true"
+      # Gateway has no /v1/embeddings -> embed locally (CPU) inside Paperless
+      PAPERLESS_AI_LLM_EMBEDDING_BACKEND: huggingface
+      PAPERLESS_LLM_INDEX_TASK_CRON: "10 3 * * *"
+      # Embedding model is cached after first download; avoid online checks
+      HF_HUB_OFFLINE: 1
