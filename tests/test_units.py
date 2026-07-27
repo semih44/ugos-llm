@@ -363,5 +363,132 @@ class TestProxyStrictness(unittest.TestCase):
                         max_tokens=bad))
 
 
+class TestSwapFailures(unittest.TestCase):
+    """Every step of the directory swap must be survivable."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.models = os.path.join(self.tmp, "models")
+        os.makedirs(self.models)
+        self._dir, self._root, self._rename = (ug.MODELS_DIR, ug.is_root,
+                                               ug._priv_rename)
+        ug.MODELS_DIR = self.models
+        ug.is_root = lambda: True
+        self.src = os.path.join(self.tmp, "src.gguf")
+        with open(self.src, "wb") as f:
+            f.write(b"GGUF" + b"\x00" * 32)
+        ug.priv_install_files("M", self.src, None, '{"v":"old"}')
+
+    def tearDown(self):
+        ug.MODELS_DIR, ug.is_root, ug._priv_rename = (self._dir, self._root,
+                                                      self._rename)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _config(self):
+        with open(os.path.join(self.models, "M", "model_config.json")) as f:
+            return f.read()
+
+    def test_failure_activating_restores_old(self):
+        real = ug._priv_rename
+
+        def flaky(src, dst):               # break only the activation step
+            if src == ".M.new":
+                raise OSError("simulated swap failure")
+            return real(src, dst)
+
+        ug._priv_rename = flaky
+        with self.assertRaises(ug.PrivError):
+            ug.priv_install_files("M", self.src, None, '{"v":"new"}')
+        ug._priv_rename = real
+        self.assertIn("old", self._config(), "previous install must be back")
+        self.assertEqual([d for d in os.listdir(self.models)
+                          if d.startswith(".")], [])
+
+    def test_failure_parking_old_keeps_everything(self):
+        real = ug._priv_rename
+
+        def flaky(src, dst):               # break the "park the old one" step
+            if dst == ".M.old":
+                raise OSError("simulated park failure")
+            return real(src, dst)
+
+        ug._priv_rename = flaky
+        with self.assertRaises(ug.PrivError):
+            ug.priv_install_files("M", self.src, None, '{"v":"new"}')
+        ug._priv_rename = real
+        self.assertIn("old", self._config())
+
+    def test_recovers_crash_between_renames(self):
+        # simulate: M was parked as .M.old, then the process died
+        os.rename(os.path.join(self.models, "M"),
+                  os.path.join(self.models, ".M.old"))
+        os.makedirs(os.path.join(self.models, ".M.new"))
+        ug.priv_install_files("M", self.src, None, '{"v":"recovered"}')
+        self.assertIn("recovered", self._config())
+        self.assertEqual([d for d in os.listdir(self.models)
+                          if d.startswith(".")], [])
+
+    def test_concurrent_install_is_refused(self):
+        os.makedirs(os.path.join(self.models, ".M.lock"))
+        with self.assertRaises(SystemExit):
+            ug.priv_install_files("M", self.src, None, '{"v":"x"}')
+        self.assertIn("old", self._config())   # untouched
+
+    def test_data_files_are_not_executable(self):
+        mode = os.stat(os.path.join(self.models, "M", "M.gguf")).st_mode
+        self.assertEqual(mode & 0o777, 0o644)
+
+
+class TestDockerPath(unittest.TestCase):
+    """The non-root path builds argv command lists — verify them without
+    actually running docker."""
+
+    def setUp(self):
+        self._root, self._docker = ug.is_root, ug._docker
+        ug.is_root = lambda: False
+        self.calls = []
+        # _priv_populate writes a temp config next to the source file
+        self.tmp = tempfile.mkdtemp()
+        self.src = os.path.join(self.tmp, "model.gguf")
+        with open(self.src, "wb") as f:
+            f.write(b"GGUF")
+
+    def tearDown(self):
+        ug.is_root, ug._docker = self._root, self._docker
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _fake(self, fail_on=None):
+        class R:
+            def __init__(self, rc):
+                self.returncode, self.stderr, self.stdout = rc, "boom", ""
+
+        def fake(argv, mounts, image=None, stdin=None):
+            self.calls.append(argv)
+            return R(1 if (fail_on and argv[0] == fail_on) else 0)
+        return fake
+
+    def test_no_shell_is_ever_used(self):
+        ug._docker = self._fake()
+        ug._priv_populate(".M.new", "M", self.src, None, "{}")
+        for argv in self.calls:
+            self.assertNotIn(argv[0], ("sh", "bash", "-c"),
+                             f"privileged step must not use a shell: {argv}")
+
+    def test_failed_copy_raises(self):
+        ug._docker = self._fake(fail_on="cp")
+        with self.assertRaises(ug.PrivError):
+            ug._priv_populate(".M.new", "M", self.src, None, "{}")
+
+    def test_failed_rename_raises(self):
+        ug._docker = self._fake(fail_on="mv")
+        with self.assertRaises(ug.PrivError):
+            ug._priv_rename(".M.new", "M")
+
+    def test_failed_cleanup_raises(self):
+        ug._docker = self._fake(fail_on="rm")
+        with self.assertRaises(ug.PrivError):
+            ug._priv_rmtree(".M.old")
+
+
 if __name__ == "__main__":
     unittest.main()

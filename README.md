@@ -140,9 +140,12 @@ This runs with root privileges on your NAS, so it is built defensively:
   moving `latest` tags. Version tags are still mutable — for bit-for-bit
   reproducibility override them with digests via `UGOS_LLM_IMG_BUSYBOX` /
   `UGOS_LLM_IMG_PYTHON`.
-- **Atomic installs.** A model is built in a temporary directory and swapped
-  in only when complete; a previous installation survives any failure and is
-  rolled back automatically.
+- **Atomic installs with rollback and crash recovery.** A model is built in a
+  temporary directory and swapped in only when complete. A previous
+  installation is parked as a rollback copy until the swap succeeds, an
+  interrupted swap (power loss) is detected and repaired on the next run, and
+  a lock directory prevents two installs of the same model from colliding.
+- **Data files are installed `644`** (no execute bit), directories `755`.
 - This project redistributes **no** UGREEN binaries, models or templates.
   Everything it touches on your NAS stays on your NAS.
 
@@ -152,7 +155,7 @@ detected and **rejected** rather than half-installed. Pick a single-file quant.
 ## Development
 
 ```bash
-python3 -m unittest discover -s tests -v    # 39 unit tests, stdlib only
+python3 -m unittest discover -s tests -v    # 48 unit tests, stdlib only
 ```
 
 CI runs the suite on Python 3.9 and 3.12 plus a ruff lint. The risky parts —

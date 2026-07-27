@@ -129,25 +129,73 @@ class PrivError(RuntimeError):
 
 
 def _priv_rmtree(dirname):
-    """Delete <MODELS_DIR>/<dirname>; tolerate a missing directory."""
+    """Delete <MODELS_DIR>/<dirname>. Missing is fine, anything else is an
+    error: silently leaving multi-GB leftovers behind would break both the
+    disk-space and the rollback guarantees."""
     path = os.path.join(MODELS_DIR, dirname)
     if is_root():
-        shutil.rmtree(path, ignore_errors=True)
+        if not os.path.exists(path):
+            return
+        try:
+            shutil.rmtree(path)
+        except OSError as e:
+            raise PrivError(f"could not remove {path}: {e}") from e
         return
-    _docker(["rm", "-rf", f"/m/{dirname}"], {MODELS_DIR: "/m"})
+    r = _docker(["rm", "-rf", f"/m/{dirname}"], {MODELS_DIR: "/m"})
+    if r.returncode != 0:
+        raise PrivError(f"could not remove {path}: "
+                        f"{r.stderr.strip()[:200]}")
 
 
 def _priv_rename(src_name, dst_name):
     """Rename inside MODELS_DIR (same filesystem => atomic)."""
     if is_root():
-        os.rename(os.path.join(MODELS_DIR, src_name),
-                  os.path.join(MODELS_DIR, dst_name))
+        try:
+            os.rename(os.path.join(MODELS_DIR, src_name),
+                      os.path.join(MODELS_DIR, dst_name))
+        except OSError as e:
+            raise PrivError(f"rename {src_name} -> {dst_name} failed: "
+                            f"{e}") from e
         return
     r = _docker(["mv", f"/m/{src_name}", f"/m/{dst_name}"],
                 {MODELS_DIR: "/m"})
     if r.returncode != 0:
         raise PrivError(f"rename {src_name} -> {dst_name} failed: "
                         f"{r.stderr.strip()[:200]}")
+
+
+def _priv_mkdir_exclusive(dirname):
+    """Create a directory, failing if it already exists (used as a lock)."""
+    if is_root():
+        try:
+            os.mkdir(os.path.join(MODELS_DIR, dirname))
+            return True
+        except FileExistsError:
+            return False
+        except OSError as e:
+            raise PrivError(f"could not create {dirname}: {e}") from e
+    # busybox mkdir without -p fails when the directory exists
+    r = _docker(["mkdir", f"/m/{dirname}"], {MODELS_DIR: "/m"})
+    return r.returncode == 0
+
+
+def _recover_interrupted(name, work, old):
+    """Repair state left behind by a crash during a previous swap.
+
+    Cases (M = active dir, .M.new = build dir, .M.old = rollback dir):
+      M missing, .M.old present  -> the swap died mid-way: restore .M.old
+      M present, .M.old present  -> the swap succeeded: drop .M.old
+      .M.new present             -> an aborted build: drop it
+    """
+    have = os.path.exists(os.path.join(MODELS_DIR, name))
+    have_old = os.path.exists(os.path.join(MODELS_DIR, old))
+    if not have and have_old:
+        log(f"recovering interrupted install: restoring {old} -> {name}")
+        _priv_rename(old, name)
+    elif have and have_old:
+        log(f"cleaning up leftover rollback directory {old}")
+        _priv_rmtree(old)
+    _priv_rmtree(work)
 
 
 def _priv_populate(work_name, name, model_src, mmproj_src, config_json):
@@ -165,7 +213,7 @@ def _priv_populate(work_name, name, model_src, mmproj_src, config_json):
         for fn in os.listdir(work_dir):
             p = os.path.join(work_dir, fn)
             if os.path.isfile(p):
-                os.chmod(p, 0o755)
+                os.chmod(p, 0o644)     # data files need no execute bit
         return
 
     stage = os.path.dirname(os.path.abspath(model_src))
@@ -179,9 +227,14 @@ def _priv_populate(work_name, name, model_src, mmproj_src, config_json):
     if mmproj_src:
         steps.append(["cp", f"/s/{os.path.basename(mmproj_src)}",
                       f"/m/{work_name}/mmproj.gguf"])
+    files = [f"/m/{work_name}/{name}.gguf",
+             f"/m/{work_name}/model_config.json"]
+    if mmproj_src:
+        files.append(f"/m/{work_name}/mmproj.gguf")
     steps += [["cp", f"/s/{os.path.basename(cfg_path)}",
                f"/m/{work_name}/model_config.json"],
-              ["chmod", "-R", "755", f"/m/{work_name}"]]
+              ["chmod", "755", f"/m/{work_name}"],
+              ["chmod", "644"] + files]
     try:
         for argv in steps:
             r = _docker(argv, mounts)
@@ -204,25 +257,46 @@ def priv_install_files(name, model_src, mmproj_src, config_json):
     validate_name(name)
     work = f".{name}.new"
     old = f".{name}.old"
-    _priv_rmtree(work)
-    _priv_rmtree(old)
-    try:
-        _priv_populate(work, name, model_src, mmproj_src, config_json)
-    except Exception as e:          # incl. OSError from the native path
-        _priv_rmtree(work)
-        raise PrivError(str(e)) from e
+    lock = f".{name}.lock"
 
-    existing = os.path.exists(os.path.join(MODELS_DIR, name))
-    if existing:
-        _priv_rename(name, old)            # keep the old one as rollback
+    if not _priv_mkdir_exclusive(lock):
+        die(f"another install of {name!r} is in progress (lock directory "
+            f"{os.path.join(MODELS_DIR, lock)} exists). If no other install "
+            "is running, remove that directory and retry.")
     try:
-        _priv_rename(work, name)
-    except PrivError:
-        if existing:                       # put the working version back
-            _priv_rename(old, name)
-        _priv_rmtree(work)
-        raise
-    _priv_rmtree(old)
+        _recover_interrupted(name, work, old)
+        try:
+            _priv_populate(work, name, model_src, mmproj_src, config_json)
+        except Exception as e:      # incl. OSError from the native path
+            _priv_rmtree(work)
+            raise PrivError(str(e)) from e
+
+        existing = os.path.exists(os.path.join(MODELS_DIR, name))
+        if existing:
+            try:
+                _priv_rename(name, old)    # keep the old one as rollback
+            except Exception as e:
+                _priv_rmtree(work)         # nothing was activated yet
+                raise PrivError(
+                    f"could not park the existing installation ({e}); it "
+                    "remains active and untouched.") from e
+        try:
+            _priv_rename(work, name)
+        except Exception as e:
+            if existing:                   # put the working version back
+                try:
+                    _priv_rename(old, name)
+                except Exception as e2:
+                    raise PrivError(
+                        f"activation failed ({e}) AND rollback failed ({e2}). "
+                        f"Your previous installation is intact at "
+                        f"{os.path.join(MODELS_DIR, old)} — rename it back to "
+                        f"{name} manually.") from e
+            _priv_rmtree(work)
+            raise PrivError(str(e)) from e
+        _priv_rmtree(old)
+    finally:
+        _priv_rmtree(lock)
 
 
 def priv_remove_dir(name):
@@ -272,8 +346,10 @@ def db_write(sql, params=()):
 
 def db_backup():
     """Consistent backup via SQLite's backup API (copyfile misses the WAL)."""
-    dest = os.path.join(_staging_dir(),
-                        f"aiconsole.db.backup-{time.strftime('%Y%m%d-%H%M%S')}")
+    # millisecond suffix: two catalog changes in the same second must not
+    # overwrite each other's backup
+    stamp = f"{time.strftime('%Y%m%d-%H%M%S')}-{int(time.time() * 1000) % 1000:03d}"
+    dest = os.path.join(_staging_dir(), f"aiconsole.db.backup-{stamp}")
     src = sqlite3.connect(f"file:{AICONSOLE_DB}?mode=ro", uri=True, timeout=10)
     try:
         out = sqlite3.connect(dest)
