@@ -103,7 +103,9 @@ def plan(data):
         for t in tools:
             if t["function"]["name"] == want:
                 return ("single", t)
-        return None                      # unknown target: don't guess
+        # Passing this on would hit the gateway's named-tool hang. Fail fast.
+        raise BadRequest(f"tool_choice names {want!r}, which is not in "
+                         "'tools'")
     if choice == "required":
         return ("single", tools[0]) if len(tools) == 1 else ("multi", tools)
     return None
@@ -166,11 +168,14 @@ def rewrite(body, path):
     else:
         msgs.append({"role": "user", "content": instr})
 
-    # hard cap, not a default
-    try:
-        requested = int(data.get("max_tokens") or MAX_TOKENS)
-    except (TypeError, ValueError):
-        raise BadRequest("'max_tokens' must be an integer")
+    # hard cap, not a default — and strictly a positive JSON integer
+    requested = data.get("max_tokens")
+    if requested is None:
+        requested = MAX_TOKENS
+    elif isinstance(requested, bool) or not isinstance(requested, int):
+        raise BadRequest("'max_tokens' must be a positive integer")
+    elif requested < 1:
+        raise BadRequest("'max_tokens' must be >= 1")
     data["max_tokens"] = min(requested, MAX_TOKENS)
     # emulation needs the whole answer before it can be wrapped
     if data.pop("stream", False):
@@ -179,7 +184,13 @@ def rewrite(body, path):
 
 
 def check_required(args_json, tool):
-    """Light schema validation: required keys must be present."""
+    """Presence check for required top-level keys.
+
+    Deliberately NOT a JSON Schema validator: types, enum, nested
+    requirements, arrays and additionalProperties are not enforced. Treat
+    tool arguments coming out of this proxy like any other model output —
+    validate them in your application before acting on them.
+    """
     params = tool.get("function", {}).get("parameters") or {}
     required = params.get("required") or []
     if not required:
@@ -272,11 +283,11 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_header("Cache-Control", "no-cache")
                     self.send_header("Connection", "close")
                     self.end_headers()
-                    while True:
-                        chunk = r.read(8192)
-                        if not chunk:
-                            break
-                        self.wfile.write(chunk)
+                    # readline() returns as soon as an event line is complete,
+                    # so events reach the client while they happen. read(n)
+                    # would block until the buffer fills or upstream closes.
+                    for line in r:
+                        self.wfile.write(line)
                         self.wfile.flush()
                     print(f"{self.command} {self.path} [{note},sse] -> "
                           f"{status} in {time.time()-t0:.1f}s", flush=True)

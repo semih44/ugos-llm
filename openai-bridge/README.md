@@ -50,7 +50,12 @@ model           = <DirName>/<DirName>      # e.g. Qwen3.5-9B/Qwen3.5-9B
 | `tool_choice: "auto"` / `"none"` | **passed through** — the gateway handles these natively |
 | `tool_choice: "required"`, one tool | emulated against that tool's schema |
 | `tool_choice: "required"`, several tools | emulated: the model picks one (`{"tool_name":…,"arguments":…}`), the answer is mapped back and validated against the offered names |
-| `tool_choice: {"function": {"name": …}}` | emulated against exactly that tool (unknown name → passthrough) |
+| `tool_choice: {"function": {"name": …}}` | emulated against exactly that tool (a name that isn't in `tools` → HTTP 400, because passing it on would hit the gateway's named-tool hang) |
+
+The bridge verifies that a synthetic tool call carries the schema's
+**required top-level keys** — it is deliberately *not* a full JSON Schema
+validator (no type, enum, nested or array checks). Validate tool arguments in
+your application, as you would with any model output.
 
 Emulated requests get `stream` removed (the answer must be buffered to be
 wrapped) and `max_tokens` clamped to `MAX_TOKENS` — a **hard cap**, larger

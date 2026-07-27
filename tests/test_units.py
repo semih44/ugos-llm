@@ -9,8 +9,10 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import struct
 import sys
+import tempfile
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -168,12 +170,6 @@ class TestProxyRewrite(unittest.TestCase):
         self.assertEqual(plan[0], "single")
         self.assertEqual(plan[1]["function"]["name"], "beta")
 
-    def test_unknown_named_tool_is_passthrough(self):
-        _, _, plan = rw(dict(
-            self.base, tools=[TOOL_A],
-            tool_choice={"type": "function", "function": {"name": "ghost"}}))
-        self.assertIsNone(plan)
-
     def test_max_tokens_is_a_hard_cap(self):
         data, _, _ = rw(dict(self.base, tools=[TOOL_A],
                              tool_choice="required", max_tokens=999999))
@@ -237,9 +233,6 @@ class TestProxyWrap(unittest.TestCase):
         with self.assertRaises(ValueError):
             px.wrap_as_tool_call(self._resp("I am prose."), ("single", TOOL_A))
 
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class TestProxyHardening(unittest.TestCase):
@@ -310,3 +303,65 @@ class TestCLIValidation(unittest.TestCase):
             ["install", "o/r", "--quant", ""])
         with self.assertRaises(SystemExit):
             ug.cmd_install(args)
+
+
+class TestAtomicInstall(unittest.TestCase):
+    """The install must never leave a half-populated model directory active."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.models = os.path.join(self.tmp, "models")
+        os.makedirs(self.models)
+        self._orig_dir = ug.MODELS_DIR
+        self._orig_root = ug.is_root
+        ug.MODELS_DIR = self.models
+        ug.is_root = lambda: True          # exercise the native path
+        self.src = os.path.join(self.tmp, "src.gguf")
+        with open(self.src, "wb") as f:
+            f.write(b"GGUF" + b"\x00" * 32)
+
+    def tearDown(self):
+        ug.MODELS_DIR = self._orig_dir
+        ug.is_root = self._orig_root
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_installs_and_replaces(self):
+        ug.priv_install_files("M", self.src, None, '{"a":1}')
+        self.assertTrue(os.path.isfile(os.path.join(self.models, "M/M.gguf")))
+        # replacing must remove stale files (e.g. an old projector)
+        open(os.path.join(self.models, "M", "mmproj.gguf"), "w").close()
+        ug.priv_install_files("M", self.src, None, '{"a":2}')
+        self.assertFalse(os.path.exists(
+            os.path.join(self.models, "M", "mmproj.gguf")))
+        with open(os.path.join(self.models, "M", "model_config.json")) as f:
+            self.assertIn('"a":2', f.read())
+
+    def test_failure_keeps_previous_installation(self):
+        ug.priv_install_files("M", self.src, None, '{"v":"old"}')
+        boom = os.path.join(self.tmp, "gone.gguf")   # missing source
+        with self.assertRaises(Exception):
+            ug.priv_install_files("M", boom, None, '{"v":"new"}')
+        with open(os.path.join(self.models, "M", "model_config.json")) as f:
+            self.assertIn("old", f.read())          # rollback intact
+        leftovers = [d for d in os.listdir(self.models) if d.startswith(".")]
+        self.assertEqual(leftovers, [], "no temp dirs left behind")
+
+
+class TestProxyStrictness(unittest.TestCase):
+    base = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+
+    def test_unknown_named_tool_is_rejected(self):
+        with self.assertRaises(px.BadRequest):
+            rw(dict(self.base, tools=[TOOL_A],
+                    tool_choice={"type": "function",
+                                 "function": {"name": "ghost"}}))
+
+    def test_max_tokens_must_be_positive_int(self):
+        for bad in ("100", 1.5, True, 0, -5):
+            with self.subTest(bad=bad), self.assertRaises(px.BadRequest):
+                rw(dict(self.base, tools=[TOOL_A], tool_choice="required",
+                        max_tokens=bad))
+
+
+if __name__ == "__main__":
+    unittest.main()

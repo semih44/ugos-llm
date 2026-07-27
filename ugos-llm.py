@@ -124,51 +124,112 @@ def _docker(argv, mounts, image=IMG_BUSYBOX, stdin=None):
     return subprocess.run(cmd, input=stdin, capture_output=True, text=True)
 
 
-def priv_install_files(target_dir, name, model_src, mmproj_src, config_json):
-    """Create <MODELS_DIR>/<name>/ and place model, projector and config."""
-    _need_privileges()
-    validate_name(name)
+class PrivError(RuntimeError):
+    """A privileged step failed — caller decides how to recover."""
+
+
+def _priv_rmtree(dirname):
+    """Delete <MODELS_DIR>/<dirname>; tolerate a missing directory."""
+    path = os.path.join(MODELS_DIR, dirname)
     if is_root():
-        os.makedirs(target_dir, exist_ok=True)
-        shutil.copyfile(model_src, os.path.join(target_dir, f"{name}.gguf"))
+        shutil.rmtree(path, ignore_errors=True)
+        return
+    _docker(["rm", "-rf", f"/m/{dirname}"], {MODELS_DIR: "/m"})
+
+
+def _priv_rename(src_name, dst_name):
+    """Rename inside MODELS_DIR (same filesystem => atomic)."""
+    if is_root():
+        os.rename(os.path.join(MODELS_DIR, src_name),
+                  os.path.join(MODELS_DIR, dst_name))
+        return
+    r = _docker(["mv", f"/m/{src_name}", f"/m/{dst_name}"],
+                {MODELS_DIR: "/m"})
+    if r.returncode != 0:
+        raise PrivError(f"rename {src_name} -> {dst_name} failed: "
+                        f"{r.stderr.strip()[:200]}")
+
+
+def _priv_populate(work_name, name, model_src, mmproj_src, config_json):
+    """Fill <MODELS_DIR>/<work_name>/ with model, projector and config.
+    Raises PrivError on any failure (no partial state is ever activated)."""
+    work_dir = os.path.join(MODELS_DIR, work_name)
+    if is_root():
+        os.makedirs(work_dir, exist_ok=True)
+        shutil.copyfile(model_src, os.path.join(work_dir, f"{name}.gguf"))
         if mmproj_src:
-            shutil.copyfile(mmproj_src, os.path.join(target_dir, "mmproj.gguf"))
-        with open(os.path.join(target_dir, "model_config.json"), "w") as f:
+            shutil.copyfile(mmproj_src, os.path.join(work_dir, "mmproj.gguf"))
+        with open(os.path.join(work_dir, "model_config.json"), "w") as f:
             f.write(config_json)
-        os.chmod(target_dir, 0o755)
-        for fn in os.listdir(target_dir):
-            p = os.path.join(target_dir, fn)
+        os.chmod(work_dir, 0o755)
+        for fn in os.listdir(work_dir):
+            p = os.path.join(work_dir, fn)
             if os.path.isfile(p):
                 os.chmod(p, 0o755)
         return
 
     stage = os.path.dirname(os.path.abspath(model_src))
-    cfg_path = os.path.join(stage, f".{name}.model_config.json")
+    cfg_path = os.path.join(stage, f".{work_name}.model_config.json")
     with open(cfg_path, "w") as f:
         f.write(config_json)
     mounts = {MODELS_DIR: "/m", stage: "/s"}
-    steps = [["mkdir", "-p", f"/m/{name}"],
-             ["cp", f"/s/{os.path.basename(model_src)}", f"/m/{name}/{name}.gguf"]]
+    steps = [["mkdir", "-p", f"/m/{work_name}"],
+             ["cp", f"/s/{os.path.basename(model_src)}",
+              f"/m/{work_name}/{name}.gguf"]]
     if mmproj_src:
         steps.append(["cp", f"/s/{os.path.basename(mmproj_src)}",
-                      f"/m/{name}/mmproj.gguf"])
+                      f"/m/{work_name}/mmproj.gguf"])
     steps += [["cp", f"/s/{os.path.basename(cfg_path)}",
-               f"/m/{name}/model_config.json"],
-              ["chmod", "-R", "755", f"/m/{name}"]]
-    for argv in steps:
-        r = _docker(argv, mounts)
-        if r.returncode != 0:
+               f"/m/{work_name}/model_config.json"],
+              ["chmod", "-R", "755", f"/m/{work_name}"]]
+    try:
+        for argv in steps:
+            r = _docker(argv, mounts)
+            if r.returncode != 0:
+                raise PrivError(f"step {argv[0]} failed: "
+                                f"{r.stderr.strip()[:200]}")
+    finally:
+        if os.path.exists(cfg_path):
             os.unlink(cfg_path)
-            die(f"install step {argv[0]} failed: {r.stderr.strip()[:300]}")
-    os.unlink(cfg_path)
+
+
+def priv_install_files(name, model_src, mmproj_src, config_json):
+    """Install atomically: build in a temporary sibling directory, then swap.
+
+    A previously working installation is only removed after the replacement
+    is complete, and is restored if the swap fails. The gateway therefore
+    never sees a half-populated model directory.
+    """
+    _need_privileges()
+    validate_name(name)
+    work = f".{name}.new"
+    old = f".{name}.old"
+    _priv_rmtree(work)
+    _priv_rmtree(old)
+    try:
+        _priv_populate(work, name, model_src, mmproj_src, config_json)
+    except Exception as e:          # incl. OSError from the native path
+        _priv_rmtree(work)
+        raise PrivError(str(e)) from e
+
+    existing = os.path.exists(os.path.join(MODELS_DIR, name))
+    if existing:
+        _priv_rename(name, old)            # keep the old one as rollback
+    try:
+        _priv_rename(work, name)
+    except PrivError:
+        if existing:                       # put the working version back
+            _priv_rename(old, name)
+        _priv_rmtree(work)
+        raise
+    _priv_rmtree(old)
 
 
 def priv_remove_dir(name):
     _need_privileges()
     validate_name(name)
-    target = os.path.join(MODELS_DIR, name)
     if is_root():
-        shutil.rmtree(target)
+        shutil.rmtree(os.path.join(MODELS_DIR, name))
         return
     r = _docker(["rm", "-rf", f"/m/{name}"], {MODELS_DIR: "/m"})
     if r.returncode != 0:
@@ -611,23 +672,16 @@ def cmd_install(args):
     if mmproj_file:
         cfg["mmproj"] = "mmproj.gguf"
 
-    if os.path.exists(target):        # --force: replace, never mix
-        log(f"--force: removing existing {target} first (stale files from a "
-            "previous install must not survive)")
-        priv_remove_dir(name)
+    if os.path.exists(target):
+        log(f"--force: {target} will be replaced atomically (the existing "
+            "installation stays in place until the new one is complete)")
     log(f"Installing into {target}")
     try:
-        priv_install_files(target, name, local_model, local_mm,
+        priv_install_files(name, local_model, local_mm,
                            json.dumps(cfg, indent=2))
-    except SystemExit:
-        raise
-    except Exception as e:
-        log(f"install failed ({e}); cleaning up partial directory")
-        try:
-            priv_remove_dir(name)
-        except SystemExit:
-            pass
-        die(f"install failed: {e}")
+    except PrivError as e:
+        die(f"install failed: {e}\nNothing was activated; any previous "
+            "installation is untouched.")
 
     if args.ui:
         ui_add(name, cfg, os.path.getsize(local_model))

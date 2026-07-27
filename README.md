@@ -136,8 +136,13 @@ This runs with root privileges on your NAS, so it is built defensively:
   `release_id = 9000`; `remove` refuses to delete anything else.
 - **Never `pkill`.** The gateway does not survive it (reboot required); the CLI
   only ever prints the safe reload paths.
-- **Pinned images** (`alpine:3.20`, `python:3.12-alpine`) for privileged
-  helpers — no moving `latest` tags with write access to system data.
+- **Versioned helper images** (`alpine:3.20`, `python:3.12-alpine`) instead of
+  moving `latest` tags. Version tags are still mutable — for bit-for-bit
+  reproducibility override them with digests via `UGOS_LLM_IMG_BUSYBOX` /
+  `UGOS_LLM_IMG_PYTHON`.
+- **Atomic installs.** A model is built in a temporary directory and swapped
+  in only when complete; a previous installation survives any failure and is
+  rolled back automatically.
 - This project redistributes **no** UGREEN binaries, models or templates.
   Everything it touches on your NAS stays on your NAS.
 
@@ -147,13 +152,19 @@ detected and **rejected** rather than half-installed. Pick a single-file quant.
 ## Development
 
 ```bash
-python3 -m unittest discover -s tests -v    # 28 unit tests, stdlib only
+python3 -m unittest discover -s tests -v    # 39 unit tests, stdlib only
 ```
 
 CI runs the suite on Python 3.9 and 3.12 plus a ruff lint. The risky parts —
-name validation, GGUF header parsing, architecture rules, split detection and
-the proxy's rewrite/wrap logic — are covered by tests; the NAS-facing parts are
-verified manually on hardware (see the version banner above).
+name validation, GGUF header parsing, architecture rules, split detection,
+atomic install/rollback and the proxy's rewrite/wrap logic — are covered by
+tests; the NAS-facing parts are verified manually on hardware (see the version
+banner above).
+
+Known limits, stated plainly: the bridge checks that a synthetic tool call
+carries the schema's *required* top-level keys, but it is **not** a JSON Schema
+validator (no type/enum/nested checks) — validate tool arguments in your
+application, as you would with any model output.
 
 ## Disclaimer
 
