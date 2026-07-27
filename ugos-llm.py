@@ -406,8 +406,16 @@ def collapse_score(text):
     return len(set(grams)) / len(grams)
 
 
-def reload_hint():
+def reload_hint(fresh_install=False):
     log("")
+    if fresh_install:
+        log("No reload needed: the gateway picks up new models automatically "
+            "and loads them on first use (first request takes ~30-60 s). "
+            "The Model Manager UI shows the new card after a page refresh.")
+        log("Only if you later CHANGE this model's config: toggle it OFF/ON "
+            "in Model Manager or reboot — and never kill llama-server "
+            "processes (the gateway won't recover until reboot).")
+        return
     log("RELOAD REQUIRED — llama-server only reads its config when it spawns:")
     log("  * toggle the model OFF and back ON in Model Manager, or")
     log("  * reboot the NAS.")
@@ -602,8 +610,14 @@ def cmd_install(args):
 
     log("")
     log(f"DONE. Model id for API calls: {name}/{name}")
-    reload_hint()
-    log(f"Then run:  python3 {os.path.basename(sys.argv[0])} test {name}")
+    reload_hint(fresh_install=True)
+    if args.test:
+        log("")
+        log("--test given: running the acceptance suite now ...")
+        cmd_test(argparse.Namespace(name=name, vision=bool(mmproj_file)))
+    else:
+        log(f"Verify with:  python3 {os.path.basename(sys.argv[0])} "
+            f"test {name}")
 
 
 def ui_add(name, cfg, size_bytes):
@@ -873,6 +887,8 @@ def build_parser():
     p.add_argument("--ui", action="store_true",
                    help="add a Model Manager card (backs up the catalog DB)")
     p.add_argument("--ctx", type=int, default=16384)
+    p.add_argument("--test", action="store_true",
+                   help="run the acceptance suite right after installing")
     p.add_argument("--force", action="store_true")
     p.add_argument("--keep-staging", action="store_true")
     p.set_defaults(fn=cmd_install)

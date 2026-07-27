@@ -51,14 +51,11 @@ curl -LO https://raw.githubusercontent.com/OWNER/ugos-llm/main/ugos-llm.py
 # 1. Pre-flight: is this model going to work?
 python3 ugos-llm.py check unsloth/Qwen3.5-9B-GGUF
 
-# 2. Install it (Q4_K_M quant, with vision, with a Model Manager UI card)
-python3 ugos-llm.py install unsloth/Qwen3.5-9B-GGUF --quant Q4_K_M --vision --ui
-
-# 3. Reload: toggle the model OFF/ON in Model Manager, or reboot the NAS
-#    (there is no other reliable way — see docs/known-bugs.md)
-
-# 4. Verify
-python3 ugos-llm.py test Qwen3.5-9B
+# 2. Install it (Q4_K_M quant, with vision + Model Manager UI card) and
+#    verify it in one go — the gateway loads new models on first use,
+#    no reload or reboot needed:
+python3 ugos-llm.py install unsloth/Qwen3.5-9B-GGUF \
+    --quant Q4_K_M --vision --ui --test
 ```
 
 After that, the model is selectable in Uliya (chat, knowledge base, intelligent
