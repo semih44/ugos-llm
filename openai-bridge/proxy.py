@@ -60,32 +60,48 @@ MULTI_INSTR = (
 )
 
 
-def scrub_schema(node):
-    """Drop OpenAI-only keywords the model doesn't need."""
+class BadRequest(ValueError):
+    """Client sent something we can answer with a clean HTTP 400."""
+
+
+def scrub_schema(node, in_properties=False):
+    """Drop OpenAI-only keywords ("strict") at schema level. Keys inside a
+    "properties" map are property NAMES and must never be touched — a schema
+    may legitimately define properties called "strict" or similar."""
     if isinstance(node, dict):
-        node.pop("strict", None)
-        node.pop("additionalProperties", None)
-        for v in node.values():
-            scrub_schema(v)
+        if not in_properties:
+            node.pop("strict", None)
+        for k, v in node.items():
+            scrub_schema(v, in_properties=(not in_properties
+                                           and k == "properties"))
     elif isinstance(node, list):
         for v in node:
-            scrub_schema(v)
+            scrub_schema(v, in_properties=False)
     return node
 
 
 def plan(data):
     """Decide whether to emulate. Returns None (passthrough) or
-    ("single", tool) / ("multi", tools)."""
+    ("single", tool) / ("multi", tools). Raises BadRequest on malformed
+    tool definitions."""
     tools = data.get("tools")
-    if not tools or not isinstance(tools, list):
+    if not tools:
         return None
+    if not isinstance(tools, list):
+        raise BadRequest("'tools' must be an array")
+    for t in tools:
+        if (not isinstance(t, dict)
+                or not isinstance(t.get("function"), dict)
+                or not isinstance(t["function"].get("name"), str)):
+            raise BadRequest("malformed entry in 'tools' (need "
+                             "{type, function:{name,...}})")
     choice = data.get("tool_choice", "auto")
     if choice in ("none", "auto", None):
         return None                      # gateway handles these natively
     if isinstance(choice, dict):
         want = (choice.get("function") or {}).get("name")
         for t in tools:
-            if t.get("function", {}).get("name") == want:
+            if t["function"]["name"] == want:
                 return ("single", t)
         return None                      # unknown target: don't guess
     if choice == "required":
@@ -141,19 +157,39 @@ def rewrite(body, path):
     data.pop("tools", None)
     data.pop("tool_choice", None)
     data.pop("parallel_tool_calls", None)
-    msgs = data.get("messages", [])
-    if msgs and isinstance(msgs[-1].get("content"), str):
+    msgs = data.get("messages")
+    if not isinstance(msgs, list):
+        raise BadRequest("'messages' must be an array")
+    if msgs and isinstance(msgs[-1], dict) \
+            and isinstance(msgs[-1].get("content"), str):
         msgs[-1]["content"] += instr
     else:
         msgs.append({"role": "user", "content": instr})
 
     # hard cap, not a default
-    data["max_tokens"] = min(int(data.get("max_tokens") or MAX_TOKENS),
-                             MAX_TOKENS)
+    try:
+        requested = int(data.get("max_tokens") or MAX_TOKENS)
+    except (TypeError, ValueError):
+        raise BadRequest("'max_tokens' must be an integer")
+    data["max_tokens"] = min(requested, MAX_TOKENS)
     # emulation needs the whole answer before it can be wrapped
     if data.pop("stream", False):
         note += ",stream-disabled"
     return json.dumps(data).encode("utf-8"), note, p
+
+
+def check_required(args_json, tool):
+    """Light schema validation: required keys must be present."""
+    params = tool.get("function", {}).get("parameters") or {}
+    required = params.get("required") or []
+    if not required:
+        return
+    obj = json.loads(args_json)
+    if not isinstance(obj, dict):
+        raise ValueError("tool arguments are not a JSON object")
+    missing = [k for k in required if k not in obj]
+    if missing:
+        raise ValueError(f"tool arguments missing required keys: {missing}")
 
 
 def wrap_as_tool_call(payload, p):
@@ -164,13 +200,16 @@ def wrap_as_tool_call(payload, p):
     kind, spec = p
     if kind == "single":
         name, args = spec["function"]["name"], raw
+        check_required(args, spec)
     else:
         obj = json.loads(raw)
         name = obj.get("tool_name")
-        valid = {t["function"]["name"] for t in spec}
-        if name not in valid:
+        chosen = next((t for t in spec
+                       if t["function"]["name"] == name), None)
+        if chosen is None:
             raise ValueError(f"model picked unknown tool {name!r}")
         args = json.dumps(obj.get("arguments") or {})
+        check_required(args, chosen)
     choice["message"] = {"role": "assistant", "content": None,
                          "tool_calls": [{"id": "call_bridge_0",
                                          "type": "function",
@@ -197,7 +236,22 @@ class Handler(BaseHTTPRequestHandler):
         t0 = time.time()
         note, p = "-", None
         if body is not None:
-            body, note, p = rewrite(body, self.path)
+            try:
+                body, note, p = rewrite(body, self.path)
+            except BadRequest as e:
+                self._send(400, json.dumps(
+                    {"error": {"message": str(e),
+                               "type": "invalid_request_error"}}).encode())
+                print(f"{self.command} {self.path} [bad-request] -> 400 "
+                      f"({e})", flush=True)
+                return
+            except Exception as e:  # never tear down the connection
+                self._send(400, json.dumps(
+                    {"error": {"message": f"unprocessable request: {e}",
+                               "type": "invalid_request_error"}}).encode())
+                print(f"{self.command} {self.path} [rewrite-error] -> 400 "
+                      f"({type(e).__name__}: {e})", flush=True)
+                return
         req = urllib.request.Request(UPSTREAM + self.path, data=body,
                                      method=self.command)
         for h in ("Content-Type", "Authorization", "Accept"):
@@ -209,10 +263,14 @@ class Handler(BaseHTTPRequestHandler):
                 status = r.status
                 ctype = r.headers.get("Content-Type", "application/json")
                 if p is None and "text/event-stream" in ctype:
-                    # stream passthrough: relay chunks as they arrive
+                    # Stream passthrough. Without Content-Length the client
+                    # can only detect the end via connection close — announce
+                    # and enforce that, or HTTP/1.1 keep-alive hangs forever.
+                    self.close_connection = True
                     self.send_response(status)
                     self.send_header("Content-Type", ctype)
                     self.send_header("Cache-Control", "no-cache")
+                    self.send_header("Connection", "close")
                     self.end_headers()
                     while True:
                         chunk = r.read(8192)
@@ -261,6 +319,10 @@ class Handler(BaseHTTPRequestHandler):
         try:
             n = int(self.headers.get("Content-Length", 0) or 0)
         except ValueError:
+            self._send(400, b'{"error":{"message":"bad Content-Length"}}')
+            return
+        if n < 0:
+            # read(-1) would block until EOF and pin a handler thread
             self._send(400, b'{"error":{"message":"bad Content-Length"}}')
             return
         if n > MAX_BODY:

@@ -45,9 +45,13 @@ MODELS_DIR = "/opt/ugreen/ai/models"
 GATEWAY = "http://127.0.0.1:62891"
 AICONSOLE_DB = "/volume1/@appstore/com.ugreen.aiconsole/db/aiconsole.db"
 
-# Pinned images: privileged file/DB operations must not depend on a moving tag.
-IMG_BUSYBOX = "docker.io/library/alpine:3.20"
-IMG_PYTHON = "docker.io/library/python:3.12-alpine"
+# Versioned images for privileged helpers. Version tags are not immutable
+# (only digests are) — if you want bit-for-bit reproducibility, override
+# these with digest references via the environment.
+IMG_BUSYBOX = os.environ.get("UGOS_LLM_IMG_BUSYBOX",
+                             "docker.io/library/alpine:3.20")
+IMG_PYTHON = os.environ.get("UGOS_LLM_IMG_PYTHON",
+                            "docker.io/library/python:3.12-alpine")
 
 # Catalog rows created by this tool are marked with this release_id so that
 # `remove`/`ui remove` can never delete a vendor row.
@@ -524,25 +528,36 @@ def _download(url, dest, label, expect_size=0):
     os.rename(tmp, dest)
 
 
-def _staged(stage, filename, expect_size):
-    """Reuse a staged download only if its size matches exactly."""
-    p = os.path.join(stage, filename)
+def _staged(stage, repo, filename, expect_size):
+    """Staging cache keyed by repo AND filename; reuse only when the size
+    matches and the file really is a GGUF (guards against collisions and
+    torn downloads)."""
+    key = f"{repo.replace('/', '--')}--{os.path.basename(filename)}"
+    p = os.path.join(stage, key)
     if os.path.exists(p):
-        if expect_size and os.path.getsize(p) == expect_size:
-            log(f"    reusing staged {filename}")
+        ok = expect_size and os.path.getsize(p) == expect_size
+        if ok:
+            with open(p, "rb") as f:
+                ok = f.read(4) == b"GGUF"
+        if ok:
+            log(f"    reusing staged {key}")
             return p, True
-        log(f"    discarding incomplete staged {filename}")
+        log(f"    discarding unusable staged {key}")
         os.unlink(p)
     return p, False
 
 
 def cmd_install(args):
     repo = args.repo
+    if not (2048 <= args.ctx <= 65536):
+        die(f"--ctx {args.ctx} is outside the sane range 2048..65536.")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", args.quant or ""):
+        die(f"--quant {args.quant!r} is not a plausible quant name.")
     name = validate_name(
         args.name or re.sub(r"-?GGUF$", "", repo.split("/")[-1], flags=re.I))
     target = os.path.join(MODELS_DIR, name)
     if os.path.exists(target) and not args.force:
-        die(f"{target} already exists (use --force to overwrite, or --name).")
+        die(f"{target} already exists (use --force to replace, or --name).")
 
     files = hf_repo_files(repo)
     ggufs = [(n, s) for n, s in files
@@ -578,13 +593,13 @@ def cmd_install(args):
 
     stage = _staging_dir()
     log(f"Staging in {stage}")
-    local_model, have = _staged(stage, os.path.basename(model_file), model_size)
+    local_model, have = _staged(stage, repo, model_file, model_size)
     if not have:
         _download(f"https://huggingface.co/{repo}/resolve/main/{model_file}",
                   local_model, "model", model_size)
     local_mm = None
     if mmproj_file:
-        local_mm, have = _staged(stage, f"{name}-mmproj.gguf", mmproj_size)
+        local_mm, have = _staged(stage, repo, mmproj_file, mmproj_size)
         if not have:
             _download(f"https://huggingface.co/{repo}/resolve/main/{mmproj_file}",
                       local_mm, "mmproj", mmproj_size)
@@ -596,9 +611,23 @@ def cmd_install(args):
     if mmproj_file:
         cfg["mmproj"] = "mmproj.gguf"
 
+    if os.path.exists(target):        # --force: replace, never mix
+        log(f"--force: removing existing {target} first (stale files from a "
+            "previous install must not survive)")
+        priv_remove_dir(name)
     log(f"Installing into {target}")
-    priv_install_files(target, name, local_model, local_mm,
-                       json.dumps(cfg, indent=2))
+    try:
+        priv_install_files(target, name, local_model, local_mm,
+                           json.dumps(cfg, indent=2))
+    except SystemExit:
+        raise
+    except Exception as e:
+        log(f"install failed ({e}); cleaning up partial directory")
+        try:
+            priv_remove_dir(name)
+        except SystemExit:
+            pass
+        die(f"install failed: {e}")
 
     if args.ui:
         ui_add(name, cfg, os.path.getsize(local_model))
@@ -622,8 +651,23 @@ def cmd_install(args):
 
 def ui_add(name, cfg, size_bytes):
     validate_name(name)
-    if db_read("SELECT id FROM model_config WHERE code = ?", (name,)):
-        log(f"UI: a catalog row for {name} already exists.")
+    existing = db_read("SELECT id, release_id FROM model_config "
+                       "WHERE code = ?", (name,))
+    if existing:
+        if existing[0][1] != OUR_RELEASE_ID:
+            log(f"UI: {name} has a vendor catalog row — leaving it alone.")
+            return
+        # ours: refresh size/capabilities so a forced reinstall stays accurate
+        log(f"UI: catalog backup -> {db_backup()}")
+        ext = json.dumps({"num_ctx": cfg["num_ctx"],
+                          "context_length": cfg["context_length"],
+                          "capabilities": cfg["capabilities"]})
+        db_write("UPDATE model_config SET version_size = ?, memory_usage = ?, "
+                 "ext = ?, updated_at = datetime('now') "
+                 "WHERE code = ? AND release_id = ?",
+                 (size_bytes, f"{size_bytes/1e9:.0f} GB", ext, name,
+                  OUR_RELEASE_ID))
+        log(f"UI: catalog row for {name} updated.")
         return
     log(f"UI: catalog backup -> {db_backup()}")
     donor = db_read("SELECT ext_arch_tools FROM model_config "

@@ -194,8 +194,10 @@ class TestProxyRewrite(unittest.TestCase):
         data, _, _ = rw(dict(self.base, tools=[TOOL_A],
                              tool_choice="required"))
         blob = data["messages"][-1]["content"]
-        self.assertNotIn("additionalProperties", blob)
-        self.assertNotIn("strict", blob)
+        # "strict" is an OpenAI API extension, not JSON Schema — drop it.
+        # "additionalProperties" IS legitimate JSON Schema — keep it.
+        self.assertNotIn('"strict"', blob)
+        self.assertIn("additionalProperties", blob)
 
 
 class TestProxyWrap(unittest.TestCase):
@@ -238,3 +240,73 @@ class TestProxyWrap(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestProxyHardening(unittest.TestCase):
+    """Malformed input must produce clean errors, never crashes or
+    silent data loss."""
+    base = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+
+    def test_null_tool_entry_is_bad_request(self):
+        with self.assertRaises(px.BadRequest):
+            px.rewrite(json.dumps(dict(self.base, tools=[None],
+                                       tool_choice="required")).encode(),
+                       "/v1/chat/completions")
+
+    def test_tools_not_a_list_is_bad_request(self):
+        with self.assertRaises(px.BadRequest):
+            px.rewrite(json.dumps(dict(self.base, tools="x",
+                                       tool_choice="required")).encode(),
+                       "/v1/chat/completions")
+
+    def test_non_integer_max_tokens_is_bad_request(self):
+        with self.assertRaises(px.BadRequest):
+            px.rewrite(json.dumps(dict(self.base, tools=[TOOL_A],
+                                       tool_choice="required",
+                                       max_tokens="lots")).encode(),
+                       "/v1/chat/completions")
+
+    def test_messages_not_a_list_is_bad_request(self):
+        with self.assertRaises(px.BadRequest):
+            px.rewrite(json.dumps({"model": "m", "messages": "hi",
+                                   "tools": [TOOL_A],
+                                   "tool_choice": "required"}).encode(),
+                       "/v1/chat/completions")
+
+    def test_scrub_keeps_property_named_strict(self):
+        schema = {"type": "object",
+                  "properties": {"strict": {"type": "boolean"},
+                                 "additionalProperties": {"type": "string"}},
+                  "strict": True}
+        out = px.scrub_schema(json.loads(json.dumps(schema)))
+        self.assertNotIn("strict", out)               # keyword removed
+        self.assertIn("strict", out["properties"])    # property kept
+        self.assertIn("additionalProperties", out["properties"])
+
+    def test_wrap_rejects_missing_required_args(self):
+        resp = json.dumps({"choices": [{"index": 0, "finish_reason": "stop",
+                                        "message": {"role": "assistant",
+                                                    "content": '{"y": "1"}'}}]}
+                          ).encode()
+        tool = {"type": "function", "function": {
+            "name": "alpha",
+            "parameters": {"type": "object",
+                           "properties": {"x": {"type": "string"}},
+                           "required": ["x"]}}}
+        with self.assertRaises(ValueError):
+            px.wrap_as_tool_call(resp, ("single", tool))
+
+
+class TestCLIValidation(unittest.TestCase):
+    def test_ctx_bounds_rejected(self):
+        for ctx in (-1, 0, 100, 999999):
+            args = ug.build_parser().parse_args(
+                ["install", "o/r", "--ctx", str(ctx)])
+            with self.subTest(ctx=ctx), self.assertRaises(SystemExit):
+                ug.cmd_install(args)
+
+    def test_empty_quant_rejected(self):
+        args = ug.build_parser().parse_args(
+            ["install", "o/r", "--quant", ""])
+        with self.assertRaises(SystemExit):
+            ug.cmd_install(args)
