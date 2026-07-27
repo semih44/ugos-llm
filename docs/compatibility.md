@@ -67,6 +67,10 @@ python3 ugos-llm.py test <Name> --vision     # if you installed a projector
 
 The `test` long-prompt check is specifically designed to expose the ub-4096
 class of corruption; if it passes together with the tool check, the model is
-genuinely usable including Uliya's intelligent commands. Open an issue with
-the model, quant, and test output — the matrix above grows from exactly
-such reports.
+genuinely usable including Uliya's intelligent commands.
+
+`test` ends with a ready-made **report block** (model, architecture, file
+size, ub, per-check results, device). Paste it into a
+["Model compatibility report" issue](../../issues/new?template=model-report.yml)
+— the matrix above grows from exactly such reports, for working *and* for
+failing models.

@@ -1,0 +1,70 @@
+name: Model compatibility report
+description: >
+  Tested a model with `ugos-llm test`? Report the result — working or not —
+  and it goes into the compatibility matrix.
+title: "[model] <repo> <quant>: <works / fails>"
+labels: ["model-report"]
+body:
+  - type: markdown
+    attributes:
+      value: >
+        Thanks! Reports like this are how docs/compatibility.md grows.
+        The fastest way to fill this out: run
+        `python3 ugos-llm.py test <Name>` and paste its report block below.
+  - type: input
+    id: repo
+    attributes:
+      label: Hugging Face repo
+      placeholder: unsloth/Qwen3.5-9B-GGUF
+    validations:
+      required: true
+  - type: input
+    id: quant
+    attributes:
+      label: Quantization
+      placeholder: Q4_K_M
+    validations:
+      required: true
+  - type: dropdown
+    id: device
+    attributes:
+      label: Device
+      options:
+        - NASync iDX6011 (32 GB)
+        - NASync iDX6011 (64 GB)
+        - NASync iDX6011 Pro
+        - other (please note below)
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: UGOS / Model Manager version
+      description: Model Manager version is shown in the App Center.
+      placeholder: "Model Manager 1.17.0.0055"
+  - type: dropdown
+    id: outcome
+    attributes:
+      label: Overall outcome
+      options:
+        - all checks pass (chat, long-prompt, tools)
+        - works partially (some checks fail)
+        - fails completely
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Output of `ugos-llm test` (and anything else relevant)
+      description: Paste the PASS/FAIL block and, if it exists, the report block.
+      render: text
+    validations:
+      required: true
+  - type: checkboxes
+    id: extras
+    attributes:
+      label: Also verified
+      options:
+        - label: Vision (`test --vision` passes)
+        - label: Usable in Uliya chat
+        - label: Uliya "intelligent commands" work with it

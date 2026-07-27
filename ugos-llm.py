@@ -755,13 +755,37 @@ def cmd_test(args):
     for label, ok, dt, detail in results:
         fails += 0 if ok else 1
         log(f"  {'PASS' if ok else 'FAIL':4s} {label:12s} {dt:5.1f}s  {detail}")
+
+    # copy-pasteable block for a "Model compatibility report" issue
+    arch = size_gb = "?"
+    try:
+        gguf = os.path.join(MODELS_DIR, name, f"{name}.gguf")
+        size_gb = f"{os.path.getsize(gguf)/1e9:.1f} GB"
+        with open(gguf, "rb") as f:
+            arch = parse_gguf_meta(
+                io.BytesIO(f.read(4 << 20))).get("general.architecture", "?")
+    except (OSError, GGUFError):
+        pass
+    device = "?"
+    try:
+        device = open("/sys/class/dmi/id/product_name").read().strip() or "?"
+    except OSError:
+        pass
+    ub = dict(loaded_servers()).get(name, "?")
+    log("")
+    log("---- report block (paste into a GitHub model report) ----")
+    log(f"model: {name} | arch: {arch} | file: {size_gb} | ub: {ub}")
+    log(f"device: {device}")
+    for label, ok, dt, _ in results:
+        log(f"{label}: {'PASS' if ok else 'FAIL'} ({dt:.1f}s)")
+    log("---------------------------------------------------------")
     log("")
     if fails:
         log("Some checks failed — see docs/known-bugs.md. Usual suspects: "
             "ub=4096 configs, MoE or unsupported architectures.")
         sys.exit(1)
-    log("All checks passed. Please consider reporting this model+quant as "
-        "working (docs/compatibility.md).")
+    log("All checks passed. Please consider filing a model report "
+        "(docs/compatibility.md).")
 
 
 def cmd_doctor(args):

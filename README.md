@@ -39,7 +39,11 @@ garbage output (see [Known bugs](docs/known-bugs.md)).
 
 ## Quickstart
 
-On your NAS (SSH, a user in the `docker` group — or root):
+The tool always **executes on the NAS** (it needs local paths and the
+loopback-only gateway) — but you drive it from any OS over SSH. Enable SSH in
+UGOS first: Control Panel → Terminal.
+
+On the NAS (SSH session, user in the `docker` group — or root):
 
 ```bash
 curl -LO https://raw.githubusercontent.com/OWNER/ugos-llm/main/ugos-llm.py
@@ -48,7 +52,7 @@ curl -LO https://raw.githubusercontent.com/OWNER/ugos-llm/main/ugos-llm.py
 python3 ugos-llm.py check unsloth/Qwen3.5-9B-GGUF
 
 # 2. Install it (Q4_K_M quant, with vision, with a Model Manager UI card)
-sudo python3 ugos-llm.py install unsloth/Qwen3.5-9B-GGUF --quant Q4_K_M --vision --ui
+python3 ugos-llm.py install unsloth/Qwen3.5-9B-GGUF --quant Q4_K_M --vision --ui
 
 # 3. Reload: toggle the model OFF/ON in Model Manager, or reboot the NAS
 #    (there is no other reliable way — see docs/known-bugs.md)
@@ -59,6 +63,43 @@ python3 ugos-llm.py test Qwen3.5-9B
 
 After that, the model is selectable in Uliya (chat, knowledge base, intelligent
 commands), Universal Search, and reachable for your own apps via the gateway.
+
+### From Windows, macOS or Linux — no install on the NAS needed
+
+Windows 10+ ships an OpenSSH client, so PowerShell works out of the box.
+You can even run the tool **without copying it to the NAS** by piping it
+through SSH:
+
+```powershell
+# PowerShell (Windows)
+Get-Content -Raw ugos-llm.py | ssh you@nas-ip "python3 - list"
+Get-Content -Raw ugos-llm.py | ssh you@nas-ip "python3 - check unsloth/Qwen3.5-9B-GGUF"
+```
+
+```bash
+# macOS / Linux
+ssh you@nas-ip "python3 - list" < ugos-llm.py
+```
+
+For regular use, park it on the NAS once (e.g. `/volume1/docker/ugos-llm.py`)
+and call it directly. Copying via `scp` requires the SFTP service to be
+enabled in UGOS (Control Panel → Terminal) — otherwise `scp` fails with a
+misleading "No such file or directory".
+
+### About root/sudo
+
+`check`, `list`, `test` and `doctor` need no privileges. `install`, `remove`
+and `ui` write to root-owned paths; two options:
+
+- **docker group (recommended, no sudo at all):**
+  `sudo usermod -aG docker $USER` once, log out/in — the tool then routes
+  privileged file operations through pinned containers.
+- **sudo:** run those commands as
+  `ssh -t you@nas-ip "sudo python3 /volume1/docker/ugos-llm.py install …"`
+  (`-t` gives you the password prompt; UGOS sudo always asks).
+
+There is no sudo on the Windows side — privileges are only ever needed on
+the NAS, and SSH takes care of that.
 
 ## The one fix you must not skip
 

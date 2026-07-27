@@ -1,0 +1,38 @@
+name: Bug report
+description: Something in ugos-llm or the openai-bridge misbehaves.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: >
+        Before filing: run `python3 ugos-llm.py doctor` and skim
+        docs/known-bugs.md — several scary-looking symptoms (endless
+        repetition, hanging tool calls, `connection refused` after killing a
+        process) are documented stack bugs with workarounds, not bugs in this
+        tool.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `ugos-llm doctor`
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: device
+    attributes:
+      label: Device + Model Manager version
+      placeholder: "iDX6011 32 GB, Model Manager 1.17.0.0055"
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs (bridge log, gateway error log, llama console)
+      description: See docs/troubleshooting.md for where to find them.
+      render: text
