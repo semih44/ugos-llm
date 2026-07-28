@@ -128,7 +128,9 @@ Measured ~4.7 tok/s for Gemma 4 12B Q4_K_M with roughly three quarters of the ou
 budget consumed by its thinking block; a dense 9B on the vendor build reaches
 ~12 tok/s. Pick your model accordingly.
 
-## 6. Assorted smaller surprises
+---
+
+## 7. Assorted smaller surprises
 
 - The gateway request log (`infer_gateway_serv.log`) records **only failed**
   requests — but those with full request payloads. Great for debugging,
