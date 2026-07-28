@@ -30,8 +30,15 @@ ai_mcp_serv ─────┤                       └────────
   catalog DB and downloads.
 - The llama.cpp binaries live in `/volume1/@aiconsole/llamacppSycl/` (SYCL,
   the one actually used) and `/volume1/@aiconsole/llamacppGpu/` (CUDA build,
-  idle on Intel hardware). The gateway binary is linked against the bundled
-  `libllama.so` — you cannot swap llama.cpp versions without breaking it.
+  idle on Intel hardware).
+- The gateway is a **Go binary that links only against libc** (`ldd` shows
+  vdso, libc, ld-linux — nothing else) and spawns `.llama-server` as a
+  separate child process. It therefore does *not* pin you to the bundled
+  llama.cpp version: replacing the runtime bundle is a matter of ABI-free
+  process invocation, not linking. What must match is the CLI surface
+  (`-m`, `--host <unix-socket>`, `-ngl`, `-ub`, …), unix-socket support, and
+  the host's glibc (Debian 12 / glibc 2.36 on the iDX6011 — official
+  llama.cpp Intel images are built on newer Ubuntu and need a rebuild).
 
 ## Model directory layout
 

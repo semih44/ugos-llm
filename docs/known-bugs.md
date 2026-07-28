@@ -108,6 +108,26 @@ the OpenAI SDK) never notice.
 
 ---
 
+## 6. Third-party llama.cpp builds need glibc <= 2.36
+
+UGOS is Debian 12 (glibc 2.36). The official `ghcr.io/ggml-org/llama.cpp:server-intel`
+image is built on Ubuntu 24.04: `llama-server` itself only needs GLIBC_2.34, but
+`libllama.so` and `libggml-base.so` require **GLIBC_2.38** — they cannot simply be
+dropped into the UGOS runtime bundle. A SYCL build against Ubuntu 22.04 (glibc 2.35)
+is required for native integration.
+
+Note that the gateway itself is *not* the obstacle: it links only against libc and
+spawns `.llama-server` as a child process (see how-it-works.md), so replacing the
+runtime bundle is a matter of matching the CLI surface and the host glibc, not ABI
+compatibility.
+
+Verified in a container on an iDX6011 (July 2026): current llama.cpp runs Gemma 4
+(`gemma4_assistant` architecture present) on the Arc iGPU via SYCL, loads its mmproj
+automatically and answers correctly — so the hardware and driver side is fine.
+Measured ~4.7 tok/s for Gemma 4 12B Q4_K_M with roughly three quarters of the output
+budget consumed by its thinking block; a dense 9B on the vendor build reaches
+~12 tok/s. Pick your model accordingly.
+
 ## 6. Assorted smaller surprises
 
 - The gateway request log (`infer_gateway_serv.log`) records **only failed**
