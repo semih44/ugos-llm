@@ -121,6 +121,40 @@ Full analysis: [docs/known-bugs.md](docs/known-bugs.md).
 
 Details and how to qualify new models: [docs/compatibility.md](docs/compatibility.md).
 
+## Runtime profiles (experimental): newer llama.cpp per model
+
+Everything in the table above describes UGREEN's shipped build (b8413). A
+current upstream llama.cpp fixes the `-ub 4096` bug, runs MoE models
+correctly and adds MTP speculative decoding (measured: Gemma 4 26B-A4B
+answers structured/JSON prompts *faster* than a dense 9B on the vendor
+build — see [docs/known-bugs.md §6](docs/known-bugs.md)). The `runtime`
+command lets individual models opt in to such a build while every other
+model — including UGREEN's own — keeps running the vendor runtime:
+
+```bash
+# one-time: deploy a self-built glibc-2.36-compatible runtime, then
+# swap UGREEN's 258-byte llama-server wrapper for the dispatcher
+# (the original is preserved and remains the default path)
+python3 ugos-llm.py runtime deploy /path/to/runtime-dir --name upstream-b10143
+python3 ugos-llm.py runtime enable
+
+# install a model on that runtime, with its MTP draft head
+python3 ugos-llm.py install unsloth/gemma-4-26B-A4B-it-qat-GGUF \
+    --quant UD-Q4_K_XL --vision --draft --runtime upstream-b10143 --ui --test
+
+python3 ugos-llm.py runtime status   # dispatcher + marker overview
+python3 ugos-llm.py runtime disable  # restore the vendor wrapper
+```
+
+Models opt in via a `.ugos-llm-runtime` marker file in their model
+directory; the dispatcher routes them at spawn time and fails fast if the
+requested runtime is missing (falling back silently would crash on
+upstream-only flags). `doctor` warns when a firmware update has restored
+the vendor wrapper. How to produce such a runtime build is documented in
+[docs/known-bugs.md §6](docs/known-bugs.md) — the short version: build the
+pinned llama.cpp commit with `-DGGML_SYCL=ON` against Ubuntu 22.04
+(glibc ≤ 2.36) and verify no binary needs `GLIBC_2.37+`.
+
 ## Safety
 
 This runs with root privileges on your NAS, so it is built defensively:

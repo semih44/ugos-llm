@@ -23,7 +23,7 @@ jobs:
       - name: CLI help works without arguments to the network
         run: |
           python ugos-llm.py --help > /dev/null
-          for c in check install list test doctor ui remove; do
+          for c in check install list test doctor ui runtime remove; do
             python ugos-llm.py "$c" --help > /dev/null
           done
 
