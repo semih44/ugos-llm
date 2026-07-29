@@ -5,6 +5,7 @@ the dispatcher script, and runtime-aware config linting.
 
 Run: python3 -m unittest discover -s tests -v
 """
+import json
 import os
 import shutil
 import subprocess
@@ -245,6 +246,168 @@ class TestRuntimeWrapper(unittest.TestCase):
         # and trip ggml's crashing multi-GPU peer-access path
         w = ug.runtime_wrapper_script()
         self.assertIn('OCL_ICD_VENDORS="$DIR/.no-system-icds"', w)
+
+
+class TestSidecarFilter(unittest.TestCase):
+    def test_sidecars_and_projectors_are_not_main_models(self):
+        files = [("MTP/mtp-gemma-4-26B-A4B-it-Q4_0.gguf", 1),
+                 ("mtp-gemma-4-26B-A4B-it.gguf", 1),
+                 ("eagle-head.gguf", 2),
+                 ("draft.gguf", 2),
+                 ("mmproj-F16.gguf", 5),
+                 ("gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf", 100),
+                 ("README.md", 1)]
+        mains = ug.main_model_ggufs(files)
+        self.assertEqual([n for n, _ in mains],
+                         ["gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf"])
+
+    def test_models_with_sidecar_like_substrings_survive(self):
+        # "draft"/"mtp" must only match as a name prefix, not mid-word
+        files = [("Landrafting-7B-Q4_K_M.gguf", 5)]
+        self.assertEqual(len(ug.main_model_ggufs(files)), 1)
+
+
+class TestThinkingFlag(unittest.TestCase):
+    def test_off_sets_template_kwargs(self):
+        ea = ug.build_extra_args(8192, runtime="upstream-b10143",
+                                 thinking="off")
+        i = ea.index("--chat-template-kwargs")
+        self.assertEqual(json.loads(ea[i + 1]), {"enable_thinking": False})
+
+    def test_on_sets_template_kwargs(self):
+        ea = ug.build_extra_args(8192, runtime="upstream-b10143",
+                                 thinking="on")
+        i = ea.index("--chat-template-kwargs")
+        self.assertEqual(json.loads(ea[i + 1]), {"enable_thinking": True})
+
+    def test_auto_adds_nothing(self):
+        ea = ug.build_extra_args(8192, runtime="upstream-b10143",
+                                 thinking=None)
+        self.assertNotIn("--chat-template-kwargs", ea)
+
+    def test_thinking_without_upstream_is_refused(self):
+        with self.assertRaises(SystemExit):
+            ug.build_extra_args(8192, thinking="off")
+
+
+class TestRuntimeDeployAtomic(unittest.TestCase):
+    """The working runtime must never be deleted before its replacement
+    is in place — same guarantees as the model installer."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._runtimes, self._root = ug.RUNTIMES_DIR, ug.is_root
+        self._staging, self._rename = ug._staging_dir, ug._rt_rename
+        ug.RUNTIMES_DIR = os.path.join(self.tmp, "runtimes")
+        ug.is_root = lambda: True
+        ug._staging_dir = lambda: self.tmp
+        self.src = os.path.join(self.tmp, "src")
+        os.makedirs(self.src)
+        for fn, content in (("llama-server", "#!/bin/sh\necho v1\n"),
+                            ("BUILD_INFO", "test build v1\n")):
+            with open(os.path.join(self.src, fn), "w") as f:
+                f.write(content)
+
+    def tearDown(self):
+        ug.RUNTIMES_DIR, ug.is_root = self._runtimes, self._root
+        ug._staging_dir, ug._rt_rename = self._staging, self._rename
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _target(self):
+        return os.path.join(ug.RUNTIMES_DIR, "upstream-b1")
+
+    def _build_info(self):
+        with open(os.path.join(self._target(), "BUILD_INFO")) as f:
+            return f.read()
+
+    def test_deploy_generates_wrapper(self):
+        ug.runtime_deploy(self.src, "upstream-b1")
+        wp = os.path.join(self._target(), "llama-server-wrapper")
+        self.assertTrue(os.access(wp, os.X_OK))
+
+    def test_force_replace_leaves_no_leftovers(self):
+        ug.runtime_deploy(self.src, "upstream-b1")
+        with open(os.path.join(self.src, "BUILD_INFO"), "w") as f:
+            f.write("test build v2\n")
+        ug.runtime_deploy(self.src, "upstream-b1", force=True)
+        self.assertIn("v2", self._build_info())
+        self.assertEqual([d for d in os.listdir(ug.RUNTIMES_DIR)
+                          if d.startswith(".")], [])
+
+    def test_failed_activation_restores_previous_runtime(self):
+        ug.runtime_deploy(self.src, "upstream-b1")
+        real = ug._rt_rename
+
+        def flaky(src, dst):
+            if src.endswith(".new") and dst == self._target():
+                raise OSError("simulated activation failure")
+            return real(src, dst)
+
+        ug._rt_rename = flaky
+        with self.assertRaises(SystemExit):
+            ug.runtime_deploy(self.src, "upstream-b1", force=True)
+        ug._rt_rename = real
+        self.assertTrue(os.path.isdir(self._target()),
+                        "previous runtime must still be active")
+        self.assertIn("v1", self._build_info())
+
+    def test_recovers_interrupted_swap(self):
+        ug.runtime_deploy(self.src, "upstream-b1")
+        # simulate: parked as .old, then the process died mid-swap
+        os.rename(self._target(),
+                  os.path.join(ug.RUNTIMES_DIR, ".upstream-b1.old"))
+        ug.runtime_deploy(self.src, "upstream-b1", force=True)
+        self.assertTrue(os.path.isdir(self._target()))
+        self.assertEqual([d for d in os.listdir(ug.RUNTIMES_DIR)
+                          if d.startswith(".")], [])
+
+
+class TestEnableBackupLifecycle(unittest.TestCase):
+    """A firmware update replaces the dispatcher with a NEW vendor wrapper;
+    re-enabling must back up the new one, not resurrect the old."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._bundle, self._root = ug.VENDOR_BUNDLE_DIR, ug.is_root
+        self._staging = ug._staging_dir
+        ug.VENDOR_BUNDLE_DIR = self.tmp
+        ug.is_root = lambda: True
+        ug._staging_dir = lambda: self.tmp
+        self.wrapper = os.path.join(self.tmp, "llama-server")
+        self.backup = os.path.join(self.tmp, "llama-server.ugreen-orig")
+        with open(self.wrapper, "w") as f:
+            f.write("VENDOR-V1\n")
+
+    def tearDown(self):
+        ug.VENDOR_BUNDLE_DIR, ug.is_root = self._bundle, self._root
+        ug._staging_dir = self._staging
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _read(self, path):
+        with open(path) as f:
+            return f.read()
+
+    def test_enable_backs_up_and_installs_dispatcher(self):
+        ug.runtime_enable()
+        self.assertEqual(self._read(self.backup), "VENDOR-V1\n")
+        self.assertIn(ug.DISPATCHER_TAG, self._read(self.wrapper))
+
+    def test_firmware_update_refreshes_stale_backup(self):
+        ug.runtime_enable()
+        with open(self.wrapper, "w") as f:      # firmware update: new vendor
+            f.write("VENDOR-V2\n")
+        ug.runtime_enable()
+        self.assertEqual(self._read(self.backup), "VENDOR-V2\n")
+        self.assertEqual(self._read(self.backup + ".prev"), "VENDOR-V1\n")
+        self.assertIn(ug.DISPATCHER_TAG, self._read(self.wrapper))
+
+    def test_disable_restores_current_vendor_wrapper(self):
+        ug.runtime_enable()
+        with open(self.wrapper, "w") as f:
+            f.write("VENDOR-V2\n")
+        ug.runtime_enable()
+        ug.runtime_disable()
+        self.assertEqual(self._read(self.wrapper), "VENDOR-V2\n")
 
 
 class TestHeaderProbeRetry(unittest.TestCase):

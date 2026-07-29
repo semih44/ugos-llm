@@ -56,6 +56,7 @@ cmake -B build \
 cmake --build build --config Release -j"$(nproc)"
 
 echo "=== [4/6] package: binaries, build libs, dlopen'd runtime libs ==="
+rm -rf "$OUT"          # stale libraries from a previous run must not survive
 mkdir -p "$OUT"
 cp -P build/bin/llama-server "$OUT/"
 find build -name "*.so*" -exec cp -P {} "$OUT/" \;
@@ -83,8 +84,11 @@ for pass in 1 2 3; do
     done
   done
 done
+# `grep || true`: zero matches is the GOOD case, and under pipefail a bare
+# grep exit 1 would abort the whole script right here.
 UNRESOLVED=$(cd "$OUT" && for f in llama-server *.so*; do
-  LD_LIBRARY_PATH="$OUT" ldd "$f" 2>/dev/null | grep "not found"; done | sort -u)
+  LD_LIBRARY_PATH="$OUT" ldd "$f" 2>/dev/null | grep "not found" || true
+done | sort -u)
 if [ -n "$UNRESOLVED" ]; then
   echo "FAIL: unresolved dependencies remain:"; echo "$UNRESOLVED"; exit 1
 fi

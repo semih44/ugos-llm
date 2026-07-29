@@ -580,6 +580,18 @@ def classify_arch(arch, runtime=None):
                        "Install at your own risk and run `test`.")
 
 
+# Speculative-decoding sidecars (MTP/Eagle/DFlash/draft heads) live in model
+# repos next to the main GGUF — they are companions, never the model itself.
+SIDECAR_RE = re.compile(r"(^|/)(mtp|eagle|dflash|draft)[-_.]", re.IGNORECASE)
+
+
+def main_model_ggufs(files):
+    """GGUFs that are actual language models: no projectors, no sidecars."""
+    return [(n, s) for n, s in files
+            if n.endswith(".gguf") and "mmproj" not in n.lower()
+            and not SIDECAR_RE.search(n)]
+
+
 def split_siblings(files, filename):
     """All shards belonging to a split GGUF, or [] if it isn't split."""
     m = SPLIT_RE.search(filename)
@@ -596,12 +608,15 @@ def split_siblings(files, filename):
 # Runtime profiles — vendor b8413 vs. upstream llama.cpp builds
 # --------------------------------------------------------------------------
 
-def build_extra_args(ctx, runtime=None, draft_name=None):
+def build_extra_args(ctx, runtime=None, draft_name=None, thinking=None):
     """The llama-server argv fragment for a model config, per runtime."""
     upstream = bool(runtime and str(runtime).startswith("upstream"))
     if draft_name and not upstream:
         die("--draft needs --runtime upstream-*: the vendor build (b8413) "
             "has no speculative decoding support.")
+    if thinking in ("on", "off") and not upstream:
+        die("--thinking needs --runtime upstream-*: the vendor build (b8413) "
+            "has no --chat-template-kwargs.")
     ea = list(UPSTREAM_EXTRA_ARGS if upstream else SAFE_EXTRA_ARGS)
     ea += ["-c", str(ctx)]
     if draft_name:
@@ -610,6 +625,11 @@ def build_extra_args(ctx, runtime=None, draft_name=None):
                "--spec-type", "draft-mtp",
                "--spec-draft-n-max", "4",
                "--spec-draft-ngl", "999"]
+    if thinking in ("on", "off"):
+        # server-side default — clients like Paperless never send
+        # chat_template_kwargs themselves
+        ea += ["--chat-template-kwargs",
+               json.dumps({"enable_thinking": thinking == "on"})]
     return ea
 
 
@@ -725,9 +745,9 @@ def lint_model_config(name, cfg, runtime=None, model_dir=None):
         warns.append(f"{name} uses -ub/-b 4096 -> change to 512 "
                      "(docs/known-bugs.md) and reload")
     if upstream and "--no_mmap" in ea:
-        warns.append(f"{name}: '--no_mmap' is the vendor spelling — the "
-                     "upstream runtime only accepts '--no-mmap' and will "
-                     "not start with this config")
+        warns.append(f"{name}: '--no_mmap' is the vendor spelling — b10143 "
+                     "normalizes '_' to '-' so it still works, but prefer "
+                     "the canonical '--no-mmap'")
     if "--spec-draft-model" in ea:
         p = ea[ea.index("--spec-draft-model") + 1]
         if not os.path.isabs(p) and model_dir:
@@ -821,8 +841,7 @@ def reload_hint(fresh_install=False):
 
 def cmd_check(args):
     files = hf_repo_files(args.repo)
-    ggufs = [(n, s) for n, s in files
-             if n.endswith(".gguf") and "mmproj" not in n.lower()]
+    ggufs = main_model_ggufs(files)
     mmproj = [(n, s) for n, s in files if "mmproj" in n.lower()]
     if not ggufs:
         die(f"{args.repo} contains no GGUF files.")
@@ -947,9 +966,29 @@ def cmd_install(args):
     if os.path.exists(target) and not args.force:
         die(f"{target} already exists (use --force to replace, or --name).")
 
+    # validate the runtime/draft/thinking combination BEFORE any network
+    # traffic — failing after a 14 GB download helps nobody
+    if args.runtime:
+        if not args.runtime.startswith("upstream-"):
+            die(f"--runtime {args.runtime!r}: only upstream-* runtimes exist "
+                "(e.g. upstream-b10143).")
+        validate_name(args.runtime)
+    if args.draft and not args.runtime:
+        die("--draft needs --runtime upstream-*: the vendor build (b8413) "
+            "has no speculative decoding support.")
+    if args.thinking != "auto" and not args.runtime:
+        die("--thinking needs --runtime upstream-*: the vendor build (b8413) "
+            "has no --chat-template-kwargs.")
+    if args.runtime:
+        state, _ = dispatcher_state()
+        if args.runtime not in installed_runtimes() or state != "ours":
+            log(f"NOTE: runtime {args.runtime} is not fully set up yet "
+                f"(dispatcher: {state}, deployed: {installed_runtimes()}). "
+                "The model will not load until `runtime deploy` and "
+                "`runtime enable` have run — doctor will remind you.")
+
     files = hf_repo_files(repo)
-    ggufs = [(n, s) for n, s in files
-             if n.endswith(".gguf") and "mmproj" not in n.lower()]
+    ggufs = main_model_ggufs(files)
     matches = [(n, s) for n, s in ggufs if args.quant.lower() in n.lower()]
     if not matches:
         die(f"no GGUF matching quant {args.quant!r}. Available: "
@@ -984,17 +1023,6 @@ def cmd_install(args):
         draft_file, draft_size = min(cand, key=lambda x: x[1])
         log(f"Draft head: {draft_file} ({draft_size/1e9:.2f} GB)")
 
-    if args.runtime:
-        if not args.runtime.startswith("upstream-"):
-            die(f"--runtime {args.runtime!r}: only upstream-* runtimes exist "
-                "(e.g. upstream-b10143).")
-        state, _ = dispatcher_state()
-        if args.runtime not in installed_runtimes() or state != "ours":
-            log(f"NOTE: runtime {args.runtime} is not fully set up yet "
-                f"(dispatcher: {state}, deployed: {installed_runtimes()}). "
-                "The model will not load until `runtime deploy` and "
-                "`runtime enable` have run — doctor will remind you.")
-
     meta = hf_probe_arch(repo, model_file)
     verdict, why = classify_arch(meta.get("general.architecture"),
                                  runtime=args.runtime)
@@ -1025,7 +1053,8 @@ def cmd_install(args):
            "context_length": args.ctx,
            "extra_args": build_extra_args(
                args.ctx, runtime=args.runtime,
-               draft_name=name if draft_file else None),
+               draft_name=name if draft_file else None,
+               thinking=None if args.thinking == "auto" else args.thinking),
            "capabilities": ["completion"] + (["vision"] if mmproj_file else [])}
     if mmproj_file:
         cfg["mmproj"] = "mmproj.gguf"
@@ -1237,9 +1266,9 @@ def cmd_test(args):
     try:
         gguf = os.path.join(MODELS_DIR, name, f"{name}.gguf")
         size_gb = f"{os.path.getsize(gguf)/1e9:.1f} GB"
+        # parse straight from the file: qat headers exceed any fixed buffer
         with open(gguf, "rb") as f:
-            arch = parse_gguf_meta(
-                io.BytesIO(f.read(4 << 20))).get("general.architecture", "?")
+            arch = parse_gguf_meta(f).get("general.architecture", "?")
     except (OSError, GGUFError):
         pass
     device = "?"
@@ -1332,8 +1361,17 @@ def runtime_enable():
             "missing — restore it manually before changing anything.")
     script = dispatcher_script()
     if is_root():
-        if state == "vendor" and not os.path.exists(backup):
-            shutil.copy2(path, backup)
+        if state == "vendor":
+            # A vendor wrapper in place means a fresh install OR a firmware
+            # update that replaced our dispatcher — either way the CURRENT
+            # wrapper is the authoritative vendor version. Always refresh
+            # the backup (a stale one would resurrect an old firmware's
+            # wrapper on fallback/disable); keep one rotation as .prev.
+            if os.path.exists(backup):
+                os.replace(backup, backup + ".prev")
+            tmp = backup + ".tmp"
+            shutil.copy2(path, tmp)
+            os.replace(tmp, backup)
         tmp = path + ".ugos-llm-new"
         with open(tmp, "w") as f:
             f.write(script)
@@ -1346,9 +1384,14 @@ def runtime_enable():
             f.write(script)
         mounts = {VENDOR_BUNDLE_DIR: "/b", stage: "/s"}
         steps = []
-        if state == "vendor" and not os.path.exists(backup):
-            steps.append(["cp", "-p", "/b/llama-server",
-                          "/b/llama-server.ugreen-orig"])
+        if state == "vendor":
+            if os.path.exists(backup):
+                steps.append(["mv", "/b/llama-server.ugreen-orig",
+                              "/b/llama-server.ugreen-orig.prev"])
+            steps += [["cp", "-p", "/b/llama-server",
+                       "/b/.llama-server.backup-tmp"],
+                      ["mv", "/b/.llama-server.backup-tmp",
+                       "/b/llama-server.ugreen-orig"]]
         steps += [["cp", "/s/.dispatcher.sh", "/b/.llama-server.dispatcher"],
                   ["chmod", "755", "/b/.llama-server.dispatcher"],
                   ["mv", "/b/.llama-server.dispatcher", "/b/llama-server"]]
@@ -1378,18 +1421,34 @@ def runtime_disable():
     if not os.path.exists(backup):
         die(f"vendor backup {backup} is missing — cannot restore.")
     if is_root():
-        shutil.copy2(backup, path)
+        tmp = path + ".ugos-llm-restore"
+        shutil.copy2(backup, tmp)
+        os.replace(tmp, path)      # never write into the live wrapper
     else:
-        r = _docker(["cp", "-p", "/b/llama-server.ugreen-orig",
-                     "/b/llama-server"], {VENDOR_BUNDLE_DIR: "/b"})
-        if r.returncode != 0:
-            die(f"restore failed: {r.stderr.strip()[:200]}")
+        mounts = {VENDOR_BUNDLE_DIR: "/b"}
+        for argv in (["cp", "-p", "/b/llama-server.ugreen-orig",
+                      "/b/.llama-server.restore-tmp"],
+                     ["mv", "/b/.llama-server.restore-tmp",
+                      "/b/llama-server"]):
+            r = _docker(argv, mounts)
+            if r.returncode != 0:
+                die(f"restore failed at {argv[0]}: {r.stderr.strip()[:200]}")
     log("vendor wrapper restored. Models with runtime markers will fail to "
         "spawn until you re-enable the dispatcher or reinstall them "
         "without --runtime.")
 
 
+def _rt_rename(src, dst):
+    """Rename inside RUNTIMES_DIR (root path) — separate for testability."""
+    os.rename(src, dst)
+
+
 def runtime_deploy(src_dir, rt_name, force=False):
+    """Deploy a runtime with the same guarantees as the model installer:
+    build in a work dir, park the existing runtime as rollback, swap,
+    restore on failure — the working runtime is never deleted before the
+    replacement is in place. An flock serializes concurrent deploys and
+    crash leftovers are repaired on the next run."""
     _need_privileges()
     if not rt_name:
         die("deploy needs --name (e.g. --name upstream-b10143).")
@@ -1401,53 +1460,112 @@ def runtime_deploy(src_dir, rt_name, force=False):
     if not os.path.isfile(os.path.join(src_dir, "llama-server")):
         die(f"{src_dir} does not look like a built runtime "
             "(no llama-server binary in it).")
+    if not os.path.isfile(os.path.join(src_dir, "BUILD_INFO")):
+        log("WARNING: the runtime carries no BUILD_INFO — nothing records "
+            "which commit and flags produced it. scripts/build-runtime.sh "
+            "writes one; an unverified build may lack MTP or Gemma 4.")
     if os.path.exists(os.path.join(src_dir, "libdnnl.so.3")):
         log("WARNING: the runtime bundles oneDNN — on UGREEN's OpenCL "
             "userspace that build re-JITs every prompt batch or crashes. "
             "Rebuild with -DGGML_SYCL_DNN=OFF (see docs/known-bugs.md).")
+
     target = os.path.join(RUNTIMES_DIR, rt_name)
-    if os.path.exists(target) and not force:
-        die(f"{target} already exists (use --force to replace).")
-    wrapper = runtime_wrapper_script()
+    work, old = f".{rt_name}.new", f".{rt_name}.old"
+
+    def hp(name):
+        return os.path.join(RUNTIMES_DIR, name)
+
     if is_root():
-        work = os.path.join(RUNTIMES_DIR, f".{rt_name}.new")
-        shutil.rmtree(work, ignore_errors=True)
-        shutil.copytree(src_dir, work)
-        wp = os.path.join(work, "llama-server-wrapper")
-        with open(wp, "w") as f:
-            f.write(wrapper)
-        os.chmod(wp, 0o755)
-        os.chmod(os.path.join(work, "llama-server"), 0o755)
-        if os.path.exists(target):
-            shutil.rmtree(target)
-        os.rename(work, target)
+        os.makedirs(RUNTIMES_DIR, exist_ok=True)
+
+        def _mv(a, b):
+            _rt_rename(hp(a), hp(b))
+
+        def _rm(a):
+            shutil.rmtree(hp(a))
+
+        def _build():
+            shutil.copytree(src_dir, hp(work))
+            wp = os.path.join(hp(work), "llama-server-wrapper")
+            with open(wp, "w") as f:
+                f.write(runtime_wrapper_script())
+            os.chmod(wp, 0o755)
+            os.chmod(os.path.join(hp(work), "llama-server"), 0o755)
     else:
         stage = _staging_dir()
-        wp = os.path.join(stage, ".runtime-wrapper.sh")
-        with open(wp, "w") as f:
-            f.write(wrapper)
+        wrapper_stage = os.path.join(stage, ".runtime-wrapper.sh")
         parent, base = os.path.dirname(RUNTIMES_DIR), \
             os.path.basename(RUNTIMES_DIR)
         mounts = {parent: "/rt", src_dir: "/src", stage: "/s"}
-        work = f"/rt/{base}/.{rt_name}.new"
-        steps = [["mkdir", "-p", f"/rt/{base}"],
-                 ["rm", "-rf", work],
-                 ["cp", "-r", "/src", work],
-                 ["cp", "/s/.runtime-wrapper.sh",
-                  f"{work}/llama-server-wrapper"],
-                 ["chmod", "755", f"{work}/llama-server-wrapper",
-                  f"{work}/llama-server"],
-                 ["rm", "-rf", f"/rt/{base}/{rt_name}"],
-                 ["mv", work, f"/rt/{base}/{rt_name}"]]
+
+        def _run(argv):
+            r = _docker(argv, mounts)
+            if r.returncode != 0:
+                raise PrivError(f"{argv[0]} failed: "
+                                f"{r.stderr.strip()[:200]}")
+
+        def _mv(a, b):
+            _run(["mv", f"/rt/{base}/{a}", f"/rt/{base}/{b}"])
+
+        def _rm(a):
+            _run(["rm", "-rf", f"/rt/{base}/{a}"])
+
+        def _build():
+            with open(wrapper_stage, "w") as f:
+                f.write(runtime_wrapper_script())
+            try:
+                _run(["mkdir", "-p", f"/rt/{base}"])
+                _run(["cp", "-r", "/src", f"/rt/{base}/{work}"])
+                _run(["cp", "/s/.runtime-wrapper.sh",
+                      f"/rt/{base}/{work}/llama-server-wrapper"])
+                _run(["chmod", "755",
+                      f"/rt/{base}/{work}/llama-server-wrapper",
+                      f"/rt/{base}/{work}/llama-server"])
+            finally:
+                if os.path.exists(wrapper_stage):
+                    os.unlink(wrapper_stage)
+
+    with _install_lock(f"runtime-{rt_name}"):
         try:
-            for argv in steps:
-                r = _docker(argv, mounts)
-                if r.returncode != 0:
-                    die(f"deploy failed at {argv[0]}: "
-                        f"{r.stderr.strip()[:200]}")
-        finally:
-            if os.path.exists(wp):
-                os.unlink(wp)
+            # crash recovery — same cases as _recover_interrupted
+            if not os.path.exists(target) and os.path.exists(hp(old)):
+                log(f"recovering interrupted deploy: restoring {rt_name}")
+                _mv(old, rt_name)
+            elif os.path.exists(target) and os.path.exists(hp(old)):
+                _rm(old)
+            if os.path.exists(hp(work)):
+                _rm(work)
+
+            if os.path.exists(target) and not force:
+                die(f"{target} already exists (use --force to replace).")
+
+            _build()
+            existing = os.path.exists(target)
+            if existing:
+                _mv(rt_name, old)          # park, never delete first
+            try:
+                _mv(work, rt_name)
+            except (OSError, PrivError) as e:
+                msg = f"activation failed ({e})"
+                if existing:
+                    try:
+                        _mv(old, rt_name)
+                        msg += "; the previous runtime was restored"
+                    except (OSError, PrivError) as e2:
+                        msg += (f" AND rollback failed ({e2}); the previous "
+                                f"runtime is parked at {hp(old)} — rename "
+                                "it back manually")
+                with contextlib.suppress(OSError, PrivError):
+                    _rm(work)
+                raise PrivError(msg) from e
+            if existing:
+                try:
+                    _rm(old)
+                except (OSError, PrivError):
+                    log(f"WARNING: the replaced runtime still occupies "
+                        f"{hp(old)}; the next deploy cleans it up.")
+        except (OSError, PrivError) as e:
+            die(f"deploy failed: {e}")
     log(f"runtime {rt_name} deployed to {target}")
     log("Next: `runtime enable` (if not done yet), then install a model "
         f"with --runtime {rt_name}.")
@@ -1457,7 +1575,14 @@ def cmd_runtime(args):
     if args.action == "status":
         state, path = dispatcher_state()
         log(f"bundle wrapper: {state} ({path})")
-        log("deployed runtimes: " + (", ".join(installed_runtimes()) or "none"))
+        rts = installed_runtimes()
+        log("deployed runtimes: " + (", ".join(rts) or "none"))
+        for rt in rts:
+            try:
+                with open(os.path.join(RUNTIMES_DIR, rt, "BUILD_INFO")) as f:
+                    log(f"  {rt}: {f.read().strip()}")
+            except OSError:
+                log(f"  {rt}: no BUILD_INFO — unverified build")
         markers = model_runtime_markers()
         for name, rt in sorted(markers.items()):
             log(f"  {name} -> {rt}")
@@ -1523,6 +1648,11 @@ def build_parser():
                    help="also install a speculative-decoding draft head "
                         "matching PATTERN (default: mtp) as draft.gguf; "
                         "requires --runtime upstream-*")
+    p.add_argument("--thinking", choices=["auto", "on", "off"],
+                   default="auto",
+                   help="server-side default for the model's thinking block "
+                        "(via --chat-template-kwargs; requires --runtime "
+                        "upstream-*). auto = template default")
     p.add_argument("--test", action="store_true",
                    help="run the acceptance suite right after installing")
     p.add_argument("--force", action="store_true")
