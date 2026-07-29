@@ -203,6 +203,39 @@ find and are baked into wrapper + build script; the full story:
 5. Bonus: unsloth qat GGUFs carry > 4 MB of header metadata; fixed-size
    header probes must widen their byte range.
 
+**Context is capped by memory, not by the model** (measured July 2026 while
+trying to grow Gemma 4 26B-A4B beyond 8k on a 32 GB device). Three attempts,
+three distinct failures, all reproducible:
+
+| Config | Result |
+|---|---|
+| `-c 8192 -ub 4096 -fa off` | works — the shipped configuration |
+| `-c 16384 -ub 4096 -fa off` | `failed to allocate compute pp buffers`, exits after 17 s |
+| `-c 16384 -ub 2048 -ctk q8_0 -ctv q8_0 -fa off` | same allocation failure |
+| `-c 16384 -fa on` | loads, but slower than the gateway's patience |
+
+Two lessons. **`-fa on` is still unusable**, now for a different reason than
+on b8413: the model loads (the V-cache padding warning does disappear, so
+flash attention really engages) but takes longer than the gateway's *hard,
+non-configurable* 2-minute readiness timeout — `server on unix socket … not
+ready after 240 attempts (2m0s)` — after which the gateway kills it. A
+warm SYCL JIT cache on the second attempt does not save it.
+
+And the ceiling is the **compute buffers**, not the KV cache: halving the
+microbatch and quantizing K and V to `q8_0` together were still not enough
+for 16k. On a 32 GB device a 14 GB model simply does not leave room to
+double the context.
+
+Worth knowing before you chase a bigger number anyway: prompt processing
+runs at ~115 t/s here, so filling 16k costs ~2.5 minutes and 32k ~4.5. The
+practical ceiling on this hardware is set by patience as much as by RAM.
+
+**What does work, at no memory cost:** `--chat-template-kwargs
+'{"enable_thinking":false}'` in `extra_args` (or `install --thinking off`).
+Verified: `reasoning_content` drops to 0 characters, answers start
+immediately, and the whole output budget goes to the actual answer — which
+also shortens the queue when several clients share the `-np 1` slot.
+
 ---
 
 ## 7. Assorted smaller surprises
