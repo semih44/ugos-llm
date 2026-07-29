@@ -643,17 +643,24 @@ exec "$DIR/llama-server.ugreen-orig" "$@"
 
 
 def runtime_wrapper_script():
-    """Entry point inside a deployed runtime directory. Keeps the two
-    library sets strictly apart: LD_LIBRARY_PATH only sees the new runtime;
-    the vendor bundle is referenced solely as an OpenCL ICD fallback via
-    absolute paths (SYCL prefers a host level-zero driver if present)."""
+    """Entry point inside a deployed runtime directory.
+
+    Verified on UGOS glibc 2.36 (July 2026): the runtime must bring its own
+    level-zero driver (gpu-l0/, compute-runtime 25.13 is the newest release
+    that still satisfies glibc <= 2.36) and borrows only the IGC/GMM
+    userspace from the vendor bundle — which is why the vendor dir comes
+    AFTER the runtime dir in the library path. The host's own level-zero
+    driver (1.3.x) is too old for 2025-era SYCL, and the vendor's OpenCL
+    path re-JITs kernels on every prompt batch (~2 t/s prompt processing) —
+    both are dead ends; do not "simplify" this back to either.
+    ggml backends load from the executable's directory; GGML_BACKEND_PATH
+    must stay unset (llama.cpp treats it as a file path and fails)."""
     return f"""#!/bin/bash
 # ugos-llm runtime wrapper — managed by ugos-llm.py `runtime deploy`.
 DIR="$(cd "$(dirname "$0")" && pwd)"
-export LD_LIBRARY_PATH="$DIR${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"
-export GGML_BACKEND_PATH="$DIR"
-export OCL_ICD_VENDORS="{VENDOR_BUNDLE_DIR}/ocl-vendors"
-export OCL_ICD_FILENAMES="{VENDOR_BUNDLE_DIR}/libintelocl.so:{VENDOR_BUNDLE_DIR}/libigdrcl.so"
+export LD_LIBRARY_PATH="$DIR:{VENDOR_BUNDLE_DIR}${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"
+export ZE_ENABLE_ALT_DRIVERS="$DIR/gpu-l0/libze_intel_gpu.so.1"
+export ONEAPI_DEVICE_SELECTOR="level_zero:0"
 exec "$DIR/llama-server" "$@"
 """
 
@@ -1380,6 +1387,11 @@ def runtime_deploy(src_dir, rt_name, force=False):
     if not os.path.isfile(os.path.join(src_dir, "llama-server")):
         die(f"{src_dir} does not look like a built runtime "
             "(no llama-server binary in it).")
+    if not os.path.exists(os.path.join(src_dir, "gpu-l0",
+                                       "libze_intel_gpu.so.1")):
+        log("WARNING: no gpu-l0/libze_intel_gpu.so.1 in the runtime — "
+            "SYCL will find no device on UGOS (host driver too old). "
+            "Bundle compute-runtime <= 25.13 (glibc!) before going live.")
     target = os.path.join(RUNTIMES_DIR, rt_name)
     if os.path.exists(target) and not force:
         die(f"{target} already exists (use --force to replace).")

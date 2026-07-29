@@ -222,6 +222,25 @@ class TestDispatcherScript(unittest.TestCase):
         self.assertTrue(r.stdout.startswith("VENDOR"), r.stdout + r.stderr)
 
 
+class TestRuntimeWrapper(unittest.TestCase):
+    """The wrapper encodes hard-won driver findings — pin them."""
+
+    def test_uses_bundled_level_zero_driver(self):
+        w = ug.runtime_wrapper_script()
+        self.assertIn("ZE_ENABLE_ALT_DRIVERS", w)
+        self.assertIn("gpu-l0/libze_intel_gpu.so.1", w)
+        self.assertIn("level_zero:0", w)
+
+    def test_vendor_dir_comes_after_runtime_dir(self):
+        w = ug.runtime_wrapper_script()
+        self.assertIn(f'"$DIR:{ug.VENDOR_BUNDLE_DIR}', w)
+
+    def test_no_backend_path_and_no_opencl(self):
+        w = ug.runtime_wrapper_script()
+        self.assertNotIn("GGML_BACKEND_PATH", w)   # llama.cpp treats it as a file
+        self.assertNotIn("OCL_ICD", w)             # OpenCL path: ~2 t/s pp, dead end
+
+
 class TestDispatcherState(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
