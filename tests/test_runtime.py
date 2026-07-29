@@ -38,6 +38,12 @@ class TestArchRulesPerRuntime(unittest.TestCase):
             ug.classify_arch("weird-arch", runtime="upstream-b10143")[0],
             "UNKNOWN")
 
+    def test_unverified_upstream_runtime_is_not_tested(self):
+        # a runtime is not capable just because its name says "upstream"
+        verdict, why = ug.classify_arch("gemma4", runtime="upstream-old")
+        self.assertEqual(verdict, "EXPECTED")
+        self.assertIn("unverified", why)
+
 
 class TestExtraArgs(unittest.TestCase):
     def test_vendor_args_keep_ub_512_and_underscore_mmap(self):
@@ -266,6 +272,13 @@ class TestSidecarFilter(unittest.TestCase):
         files = [("Landrafting-7B-Q4_K_M.gguf", 5)]
         self.assertEqual(len(ug.main_model_ggufs(files)), 1)
 
+    def test_versioned_sidecars_are_filtered(self):
+        # llama.cpp ships eagle3- (and future eagleN-) heads
+        files = [("eagle3-model-Q4_0.gguf", 1), ("eagle4_head.gguf", 1),
+                 ("main-Q4_K_M.gguf", 100)]
+        self.assertEqual([n for n, _ in ug.main_model_ggufs(files)],
+                         ["main-Q4_K_M.gguf"])
+
 
 class TestThinkingFlag(unittest.TestCase):
     def test_off_sets_template_kwargs(self):
@@ -360,6 +373,57 @@ class TestRuntimeDeployAtomic(unittest.TestCase):
         self.assertTrue(os.path.isdir(self._target()))
         self.assertEqual([d for d in os.listdir(ug.RUNTIMES_DIR)
                           if d.startswith(".")], [])
+
+
+class TestRuntimeDeployDockerPath(unittest.TestCase):
+    """Non-root deploy must follow the same park-before-replace order —
+    the live runtime is never rm'd before its successor is in place."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._runtimes, self._root = ug.RUNTIMES_DIR, ug.is_root
+        self._staging, self._docker = ug._staging_dir, ug._docker
+        ug.RUNTIMES_DIR = os.path.join(self.tmp, "runtimes")
+        ug.is_root = lambda: False
+        ug._staging_dir = lambda: self.tmp
+        self.calls = []
+
+        class R:
+            returncode, stderr, stdout = 0, "", ""
+
+        ug._docker = lambda argv, mounts, image=None, stdin=None: (
+            self.calls.append(argv) or R())
+        # existing live runtime, visible to the host-side exists() checks
+        os.makedirs(os.path.join(ug.RUNTIMES_DIR, "upstream-b1"))
+        self.src = os.path.join(self.tmp, "src")
+        os.makedirs(self.src)
+        for fn in ("llama-server", "BUILD_INFO"):
+            open(os.path.join(self.src, fn), "w").close()
+
+    def tearDown(self):
+        ug.RUNTIMES_DIR, ug.is_root = self._runtimes, self._root
+        ug._staging_dir, ug._docker = self._staging, self._docker
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_live_runtime_is_parked_not_deleted(self):
+        ug.runtime_deploy(self.src, "upstream-b1", force=True)
+        live = "/rt/runtimes/upstream-b1"
+        park = [i for i, argv in enumerate(self.calls)
+                if argv[:2] == ["mv", live]]
+        activate = [i for i, argv in enumerate(self.calls)
+                    if argv[0] == "mv" and argv[2] == live]
+        self.assertTrue(park and activate and park[0] < activate[0],
+                        f"park must precede activation: {self.calls}")
+        for argv in self.calls[:activate[0]]:
+            self.assertNotEqual(argv[:3], ["rm", "-rf", live],
+                                "live runtime must never be rm'd")
+
+    def test_staging_file_is_per_runtime(self):
+        ug.runtime_deploy(self.src, "upstream-b1", force=True)
+        cp = [argv for argv in self.calls
+              if argv[0] == "cp" and "runtime-wrapper" in argv[1]]
+        self.assertTrue(cp and "upstream-b1" in cp[0][1],
+                        f"staging file must carry the runtime name: {cp}")
 
 
 class TestEnableBackupLifecycle(unittest.TestCase):

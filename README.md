@@ -138,9 +138,11 @@ model — including UGREEN's own — keeps running the vendor runtime:
 python3 ugos-llm.py runtime deploy /path/to/runtime-dir --name upstream-b10143
 python3 ugos-llm.py runtime enable
 
-# install a model on that runtime, with its MTP draft head
+# install a model on that runtime, with its MTP draft head; --thinking off
+# reproduces the benchmarked configuration (13-15 t/s structured output)
 python3 ugos-llm.py install unsloth/gemma-4-26B-A4B-it-qat-GGUF \
-    --quant UD-Q4_K_XL --vision --draft --runtime upstream-b10143 --ui --test
+    --quant UD-Q4_K_XL --vision --draft --thinking off \
+    --runtime upstream-b10143 --ui --test
 
 python3 ugos-llm.py runtime status   # dispatcher + marker overview
 python3 ugos-llm.py runtime disable  # restore the vendor wrapper

@@ -90,9 +90,11 @@ ARCH_BROKEN_MOE = re.compile(r"moe", re.IGNORECASE)
 ARCH_KNOWN_MISSING = {"gemma4", "qwen3_6", "qwen36", "glm4moe"}
 
 # Verified in the b10143 container on an iDX6011 (July 2026), see
-# docs/known-bugs.md section 6.
+# docs/known-bugs.md section 6. TESTED only applies to runtimes we actually
+# verified — a runtime is not capable just because its name says "upstream".
 UPSTREAM_ARCH_TESTED = {"qwen3_5", "qwen35", "qwen3", "qwen35moe",
                         "gemma4", "gemma4moe", "gemma4_assistant"}
+UPSTREAM_TESTED_RUNTIMES = {"upstream-b10143"}
 
 STATUS = {1: "not installed", 3: "disabled", 8: "active"}
 
@@ -555,8 +557,13 @@ def classify_arch(arch, runtime=None):
     a = (arch or "").lower().replace(".", "_").replace("-", "_")
     if runtime and str(runtime).startswith("upstream"):
         if a in UPSTREAM_ARCH_TESTED:
-            return "TESTED", ("verified on this hardware with the b10143 "
-                              "container (docs/known-bugs.md section 6).")
+            if str(runtime) in UPSTREAM_TESTED_RUNTIMES:
+                return "TESTED", ("verified on this hardware with the b10143 "
+                                  "container (docs/known-bugs.md section 6).")
+            return "EXPECTED", ("architecture works on the verified b10143 "
+                                f"build, but runtime {runtime} itself is "
+                                "unverified here — run `test` after "
+                                "installing.")
         if ARCH_BROKEN_MOE.search(a):
             return "EXPECTED", ("MoE computes correctly on upstream runtimes, "
                                 "but generation is SYCL-kernel-bound and slow "
@@ -582,7 +589,8 @@ def classify_arch(arch, runtime=None):
 
 # Speculative-decoding sidecars (MTP/Eagle/DFlash/draft heads) live in model
 # repos next to the main GGUF — they are companions, never the model itself.
-SIDECAR_RE = re.compile(r"(^|/)(mtp|eagle|dflash|draft)[-_.]", re.IGNORECASE)
+# llama.cpp names them mtp-, eagle3-, dflash- (eagle\d* covers future EagleN).
+SIDECAR_RE = re.compile(r"(^|/)(mtp|eagle\d*|dflash|draft)[-_.]", re.IGNORECASE)
 
 
 def main_model_ggufs(files):
@@ -1493,7 +1501,9 @@ def runtime_deploy(src_dir, rt_name, force=False):
             os.chmod(os.path.join(hp(work), "llama-server"), 0o755)
     else:
         stage = _staging_dir()
-        wrapper_stage = os.path.join(stage, ".runtime-wrapper.sh")
+        # rt_name in the temp name: the flock is per runtime, so parallel
+        # deploys of DIFFERENT runtimes must not share a staging file
+        wrapper_stage = os.path.join(stage, f".{rt_name}.runtime-wrapper.sh")
         parent, base = os.path.dirname(RUNTIMES_DIR), \
             os.path.basename(RUNTIMES_DIR)
         mounts = {parent: "/rt", src_dir: "/src", stage: "/s"}
@@ -1516,7 +1526,7 @@ def runtime_deploy(src_dir, rt_name, force=False):
             try:
                 _run(["mkdir", "-p", f"/rt/{base}"])
                 _run(["cp", "-r", "/src", f"/rt/{base}/{work}"])
-                _run(["cp", "/s/.runtime-wrapper.sh",
+                _run(["cp", f"/s/{os.path.basename(wrapper_stage)}",
                       f"/rt/{base}/{work}/llama-server-wrapper"])
                 _run(["chmod", "755",
                       f"/rt/{base}/{work}/llama-server-wrapper",
