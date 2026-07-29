@@ -535,15 +535,20 @@ def hf_repo_files(repo):
 
 def hf_probe_arch(repo, filename, mb=4):
     url = f"https://huggingface.co/{repo}/resolve/main/{filename}"
-    try:
-        with hf_request(url, byte_range=f"0-{mb*1024*1024-1}") as r:
-            return parse_gguf_meta(io.BytesIO(r.read()))
-    except GGUFError as e:
-        die(f"cannot read GGUF header of {filename}: {e}")
-    except urllib.error.HTTPError as e:
-        die(f"cannot download header of {filename}: HTTP {e.code}")
-    except urllib.error.URLError as e:
-        die(f"network error while probing {filename}: {e.reason}")
+    sizes = [s for s in (mb, 16, 64) if s >= mb]
+    for size in sizes:
+        try:
+            with hf_request(url, byte_range=f"0-{size*1024*1024-1}") as r:
+                return parse_gguf_meta(io.BytesIO(r.read()))
+        except GGUFError as e:
+            # qat models ship >4 MB of header metadata — widen and retry
+            if "truncated header" in str(e) and size != sizes[-1]:
+                continue
+            die(f"cannot read GGUF header of {filename}: {e}")
+        except urllib.error.HTTPError as e:
+            die(f"cannot download header of {filename}: HTTP {e.code}")
+        except urllib.error.URLError as e:
+            die(f"network error while probing {filename}: {e.reason}")
 
 
 def classify_arch(arch, runtime=None):

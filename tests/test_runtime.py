@@ -241,6 +241,48 @@ class TestRuntimeWrapper(unittest.TestCase):
         self.assertNotIn("ZE_ENABLE_ALT_DRIVERS", w)
 
 
+class TestHeaderProbeRetry(unittest.TestCase):
+    """qat GGUFs carry >4 MB of metadata — the probe must widen its byte
+    range on a truncated header instead of dying."""
+
+    def setUp(self):
+        self._req = ug.hf_request
+        from test_units import gguf_bytes
+        self.full = gguf_bytes("gemma4moe", "g")
+        self.ranges = []
+
+    def tearDown(self):
+        ug.hf_request = self._req
+
+    def _fake(self, truncate_below_mb):
+        import contextlib
+        import io as _io
+
+        def fake(url, byte_range=None, timeout=60):
+            self.ranges.append(byte_range)
+            end = int(byte_range.split("-")[1])
+            data = self.full if end >= truncate_below_mb * 1024 * 1024 - 1 \
+                else self.full[:8]
+            return contextlib.closing(_io.BytesIO(data))
+        return fake
+
+    def test_retries_with_larger_range(self):
+        ug.hf_request = self._fake(truncate_below_mb=16)
+        meta = ug.hf_probe_arch("o/r", "big.gguf")
+        self.assertEqual(meta["general.architecture"], "gemma4moe")
+        self.assertGreater(len(self.ranges), 1)
+
+    def test_single_fetch_when_header_fits(self):
+        ug.hf_request = self._fake(truncate_below_mb=4)
+        ug.hf_probe_arch("o/r", "small.gguf")
+        self.assertEqual(len(self.ranges), 1)
+
+    def test_dies_when_even_the_largest_range_truncates(self):
+        ug.hf_request = self._fake(truncate_below_mb=1024)
+        with self.assertRaises(SystemExit):
+            ug.hf_probe_arch("o/r", "absurd.gguf")
+
+
 class TestDispatcherState(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
