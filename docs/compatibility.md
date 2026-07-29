@@ -3,19 +3,42 @@
 The shipped llama.cpp is **b8413** (April 2026 vintage). Anything newer than
 its architecture list cannot load, and its SYCL backend has correctness
 limits (see [known-bugs.md](known-bugs.md)). `ugos-llm check <repo>` reads
-the GGUF header straight from Hugging Face (first 4 MB, no full download)
-and applies the rules below.
+the GGUF header straight from Hugging Face (a 4 MB range, widened to 16/64 MB
+for models with oversized metadata such as QAT builds — never a full
+download) and applies the rules below.
 
-## Matrix
+Since July 2026 the verdict depends on **which runtime the model will run
+on**: UGREEN's b8413, or a newer upstream build deployed alongside it via
+`ugos-llm runtime` (see [known-bugs.md §6](known-bugs.md)). Pass
+`--runtime upstream-b10143` to `check`/`install` to be judged against the
+latter.
+
+## Matrix — vendor runtime (b8413)
 
 | Architecture (GGUF `general.architecture`) | Verdict | Notes |
 |---|---|---|
 | `qwen3_5` dense (0.8B–27B) | ✅ **TESTED** | Qwen3.5-9B Q4_K_M verified end-to-end incl. vision (mmproj) and tool calls |
-| `qwen3`, `qwen2`, `qwen2vl` dense | ✅ expected | compiled in; untested here |
+| `qwen3`, `qwen2`, `qwen2vl` dense | ✅ expected | compiled in; untested here — `qwen3` is a different family from the verified `qwen3_5` |
 | `llama` (Llama 3.x, Mistral, and most finetunes) | ✅ expected | compiled in; untested |
 | `gemma`, `gemma2`, `gemma3`, `gemma3n` | ✅ expected | HF repos are license-gated → `HF_TOKEN` needed |
 | **any MoE** (`qwen35moe`, `qwen3moe`, `qwen2moe`, `glm4moe`, …) | ❌ **BROKEN** | SYCL build emits token soup — verified with two quant families |
 | `gemma4`, `qwen3_6` and anything newer than ~04/2026 | ❌ missing | not in b8413 |
+
+## Matrix — upstream runtime (b10143, self-built)
+
+| Architecture | Verdict | Notes |
+|---|---|---|
+| `gemma4` (incl. 26B-A4B MoE) | ✅ **TESTED** | end-to-end through the gateway: chat, long prompts at `-ub 4096`, **native tool calls**, vision, MTP draft head |
+| `qwen35moe` and MoE generally | ✅ correct | no more token soup — but generation is SYCL-kernel-bound (~7 t/s for a 35B-A3B); only worth it with an MTP head |
+| every architecture the vendor build loads (`qwen3_5`, `qwen3`, `qwen2`, `llama`, `gemma`–`gemma3n`, `mistral`, `phi3`) | ✅ expected | a newer llama.cpp is an architectural superset of b8413, so these are present — but none was re-verified on this build, so none is TESTED here |
+| anything else | ⚠️ unknown | `check --runtime` reports UNKNOWN — install and run `test` |
+
+Two deliberate conservatisms in these verdicts. `TESTED` is granted only for
+the exact runtime build we verified — deploy a different one and `check`
+downgrades to `EXPECTED`, because a name like `upstream-…` proves nothing
+about what was compiled in. And dense models stay at `EXPECTED` upstream
+even where the vendor column says `TESTED`: the verification happened on
+b8413, and we did not repeat it here.
 
 ## Quantization guidance
 
@@ -38,6 +61,22 @@ Speed expectations (Core Ultra 5 125H iGPU, `-ub 512`): prompt processing
 ~180 t/s, generation ~12 t/s for a 9B Q4. First request after reload loads
 the model (~30–60 s).
 
+On the upstream runtime, Gemma 4 26B-A4B Q4 (14.2 GB) with an MTP draft head
+generates ~14.8 t/s on JSON output and ~13.4 t/s on short answers, but only
+~9.9 t/s on free prose and ~6.3 t/s at 2.5k context — speculative decoding
+helps in proportion to how predictable the output is. Those four are one
+coherent sweep measured in a container; the self-built runtime reached
+16.6 t/s on JSON and 115.8 t/s prompt processing over 2.9k tokens. Loading
+the model takes ~28 s.
+
+One sizing trap on 32 GB devices: UGOS' own task scheduler refuses to start
+an Uliya job unless *available* RAM exceeds the model's **file size** (a
+14.2 GB model demands 13588 MiB free). With a big model resident plus
+containers you can fall below that and Uliya queues forever while Paperless
+and direct gateway calls keep working. Watch for `Memory check failed` in
+`/var/ugreen/log/aiconsole_serv.log`; a reboot clears it, a smaller quant
+fixes it for good.
+
 ## Vision
 
 Qwen3.5 dense models are natively multimodal — grab the `mmproj-F16.gguf`
@@ -55,12 +94,21 @@ model thinks too much (slow responses full of reasoning), you can point
 `extra_args` to a patched template file via `--chat-template-file` — but try
 the embedded template first; it's the one the model was trained with.
 
+On the upstream runtime there is a cleaner lever: `install --thinking off`
+writes `--chat-template-kwargs '{"enable_thinking":false}'`, which settles
+the question server-side for every client. That matters for apps like
+Paperless-ngx, which never send `chat_template_kwargs` themselves — and for
+Gemma 4, whose thinking block happily consumes a whole small token budget
+before producing any answer.
+
 ## Qualifying a new model (please contribute!)
 
 ```bash
 python3 ugos-llm.py check  <repo>            # header + rules
 sudo python3 ugos-llm.py install <repo> --quant Q4_K_M
-# reload (UI toggle or reboot), then:
+# no reload needed — the gateway picks up new models and loads them on the
+# first request (~30-60 s). A reload (UI toggle or reboot) is only required
+# after CHANGING an already-installed model's config. Then:
 python3 ugos-llm.py test <Name>              # chat + long-prompt + tools
 python3 ugos-llm.py test <Name> --vision     # if you installed a projector
 ```

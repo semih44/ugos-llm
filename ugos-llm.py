@@ -83,17 +83,22 @@ VENDOR_BUNDLE_DIR = "/volume1/@aiconsole/llamacppSycl/llama-sycl/llama-sycl"
 RUNTIME_MARKER = ".ugos-llm-runtime"
 DISPATCHER_TAG = "# ugos-llm dispatcher"
 
-ARCH_TESTED_OK = {"qwen3_5", "qwen35", "qwen3"}
-ARCH_EXPECTED_OK = {"llama", "qwen2", "qwen2vl", "gemma", "gemma2",
+# TESTED means: somebody ran it end-to-end on this hardware and said so.
+# Qwen3.5-9B is that model; plain `qwen3` is a different, unverified family.
+ARCH_TESTED_OK = {"qwen3_5", "qwen35"}
+ARCH_EXPECTED_OK = {"llama", "qwen2", "qwen2vl", "qwen3", "gemma", "gemma2",
                     "gemma3", "gemma3n", "mistral", "phi3"}
 ARCH_BROKEN_MOE = re.compile(r"moe", re.IGNORECASE)
 ARCH_KNOWN_MISSING = {"gemma4", "qwen3_6", "qwen36", "glm4moe"}
 
-# Verified in the b10143 container on an iDX6011 (July 2026), see
-# docs/known-bugs.md section 6. TESTED only applies to runtimes we actually
-# verified — a runtime is not capable just because its name says "upstream".
-UPSTREAM_ARCH_TESTED = {"qwen3_5", "qwen35", "qwen3", "qwen35moe",
-                        "gemma4", "gemma4moe", "gemma4_assistant"}
+# Verified on the b10143 build on an iDX6011 (July 2026), see
+# docs/known-bugs.md section 6 — Gemma 4 end-to-end through the gateway and
+# Qwen3.5-35B-A3B for MoE correctness. TESTED only applies to runtimes we
+# actually verified: a runtime is not capable because its name says
+# "upstream". Dense models were never re-verified on this build, so they
+# stay EXPECTED here even where the vendor runtime has them as TESTED.
+UPSTREAM_ARCH_TESTED = {"qwen35moe", "gemma4", "gemma4moe",
+                        "gemma4_assistant"}
 UPSTREAM_TESTED_RUNTIMES = {"upstream-b10143"}
 
 STATUS = {1: "not installed", 3: "disabled", 8: "active"}
@@ -556,19 +561,27 @@ def hf_probe_arch(repo, filename, mb=4):
 def classify_arch(arch, runtime=None):
     a = (arch or "").lower().replace(".", "_").replace("-", "_")
     if runtime and str(runtime).startswith("upstream"):
+        moe_note = ("" if not ARCH_BROKEN_MOE.search(a) else
+                    " MoE computes correctly on upstream runtimes, but "
+                    "generation is SYCL-kernel-bound and slow (~7 t/s for a "
+                    "35B-A3B) — pair it with an MTP draft head (--draft) "
+                    "where the repo ships one.")
         if a in UPSTREAM_ARCH_TESTED:
             if str(runtime) in UPSTREAM_TESTED_RUNTIMES:
                 return "TESTED", ("verified on this hardware with the b10143 "
-                                  "container (docs/known-bugs.md section 6).")
+                                  "build (docs/known-bugs.md section 6)."
+                                  + moe_note)
             return "EXPECTED", ("architecture works on the verified b10143 "
                                 f"build, but runtime {runtime} itself is "
                                 "unverified here — run `test` after "
-                                "installing.")
-        if ARCH_BROKEN_MOE.search(a):
-            return "EXPECTED", ("MoE computes correctly on upstream runtimes, "
-                                "but generation is SYCL-kernel-bound and slow "
-                                "(~7 t/s for a 35B-A3B) — pair it with an MTP "
-                                "draft head (--draft) where the repo ships one.")
+                                "installing." + moe_note)
+        if a in ARCH_TESTED_OK or a in ARCH_EXPECTED_OK or moe_note:
+            # a newer llama.cpp is an architectural superset of b8413, so
+            # anything the vendor build can load is present here too — it
+            # just was not re-verified on this runtime.
+            return "EXPECTED", ("architecture is present in current llama.cpp "
+                                "but unverified on this runtime — run `test` "
+                                "after installing." + moe_note)
         return "UNKNOWN", ("architecture unverified on this runtime — install "
                            "at your own risk and run `test`.")
     if ARCH_BROKEN_MOE.search(a):

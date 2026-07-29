@@ -97,6 +97,11 @@ class TestArchRules(unittest.TestCase):
         self.assertEqual(ug.classify_arch("llama")[0], "EXPECTED")
         self.assertEqual(ug.classify_arch("something-new")[0], "UNKNOWN")
 
+    def test_only_the_verified_family_is_tested(self):
+        # Qwen3.5-9B is what was run end-to-end; plain qwen3 is a different,
+        # unverified family and must not inherit that claim
+        self.assertEqual(ug.classify_arch("qwen3")[0], "EXPECTED")
+
 
 class TestSplitDetection(unittest.TestCase):
     def test_detects_shards(self):

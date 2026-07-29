@@ -28,6 +28,29 @@ class TestArchRulesPerRuntime(unittest.TestCase):
         self.assertEqual(ug.classify_arch("gemma4moe", runtime=rt)[0], "TESTED")
         self.assertEqual(ug.classify_arch("qwen35moe", runtime=rt)[0], "TESTED")
 
+    def test_upstream_keeps_moe_speed_caveat_even_when_tested(self):
+        # qwen35moe is verified AND slow — the verdict must not swallow the
+        # warning that makes it actionable
+        _, why = ug.classify_arch("qwen35moe", runtime="upstream-b10143")
+        self.assertIn("slow", why.lower())
+        self.assertIn("--draft", why)
+
+    def test_upstream_inherits_vendor_architectures_as_expected(self):
+        # a newer llama.cpp is an architectural superset of b8413, so nothing
+        # the vendor build loads may come back as UNKNOWN upstream
+        rt = "upstream-b10143"
+        for arch in ("llama", "gemma2", "gemma3", "mistral", "qwen2",
+                     "qwen3", "phi3", "qwen3_5"):
+            with self.subTest(arch=arch):
+                verdict, why = ug.classify_arch(arch, runtime=rt)
+                self.assertEqual(verdict, "EXPECTED", why)
+
+    def test_dense_models_are_not_tested_upstream(self):
+        # we only ever verified Gemma 4 and the Qwen MoE on this build
+        self.assertEqual(
+            ug.classify_arch("qwen3_5", runtime="upstream-b10143")[0],
+            "EXPECTED")
+
     def test_upstream_moe_is_flagged_slow_not_broken(self):
         verdict, why = ug.classify_arch("somethingmoe", runtime="upstream-b10143")
         self.assertNotEqual(verdict, "BROKEN")

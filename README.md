@@ -6,14 +6,23 @@ UGREEN's UGOS Pro ships a locked-down Model Manager with a single built-in model
 (Qwen3.5 4B) and says third-party model support is "coming in a future update".
 It turns out the underlying stack — a llama.cpp server pool behind a local
 OpenAI-compatible gateway — already loads any compatible GGUF you place in the
-right directory with the right config. This project documents how the stack
-works and ships a CLI that automates the whole thing, including the
-**critical stability fix** without which most third-party models produce
-garbage output (see [Known bugs](docs/known-bugs.md)).
+right directory with the right config. This project documents how that stack
+works and ships a CLI that automates it, at two levels of ambition:
+
+- **Third-party models on the runtime your NAS already has.** Includes the
+  **critical stability fix** without which most of them produce garbage
+  output (see [Known bugs](docs/known-bugs.md)).
+- **Or bring your own, newer llama.cpp — per model, side by side with
+  UGREEN's.** That unlocks what the shipped build cannot do:
+  **Gemma 4 26B-A4B running natively in the Model Manager**, usable from
+  Uliya, Universal Search and your own apps — with vision, MTP speculative
+  decoding, and **real tool calls through the gateway**.
+  [Jump to it ↓](#gemma-4-moe-and-mtp-bring-your-own-llamacpp)
 
 > **Tested on:** UGREEN NASync **iDX6011** (Core Ultra 5 125H, 32 GB SKU),
 > UGOS Pro, Model Manager `1.17.0.0055`, infer_gateway `1.0.0.0004`,
-> llama.cpp build `b8413` (SYCL).
+> llama.cpp build `b8413` (SYCL, vendor) and a self-built `b10143`
+> (SYCL, upstream — see the Gemma 4 section).
 > **Expected to work identically** on the iDX6011 64 GB SKU and the
 > **NASync iDX6011 Pro** (Core Ultra 7 255H, 64 GB) — same UGOS AI stack,
 > more RAM headroom for larger models. Reports welcome.
@@ -23,9 +32,14 @@ garbage output (see [Known bugs](docs/known-bugs.md)).
 
 - `ugos-llm.py` — a single-file, stdlib-only CLI:
   - `check` a Hugging Face GGUF repo for compatibility **before** downloading
-  - `install` a model (download, configure, register) with safe defaults
+  - `install` a model (download, configure, register) with safe defaults,
+    optionally with a vision projector and an MTP draft head
   - `test` an installed model (chat, long-prompt stability, tool calls, vision)
+  - `runtime` deploy/enable a newer llama.cpp alongside the vendor's
   - `list`, `remove`, `doctor`, `ui` (Model Manager catalog entry)
+- [scripts/build-runtime.sh](scripts/build-runtime.sh) — the reproducible,
+  ELF-gated recipe for building that newer llama.cpp so it actually loads on
+  UGOS (glibc 2.36)
 - [docs/](docs/) — how the UGOS AI stack actually works (gateway, sockets,
   catalog DB, logs), a model compatibility matrix, all known bugs with fixes,
   and a debugging toolkit
@@ -65,16 +79,20 @@ commands), Universal Search, and reachable for your own apps via the gateway.
 
 Windows 10+ ships an OpenSSH client, so PowerShell works out of the box.
 You can even run the tool **without copying it to the NAS** by piping it
-through SSH:
+through SSH — fetch it to your own machine first:
 
 ```powershell
 # PowerShell (Windows)
+Invoke-WebRequest -OutFile ugos-llm.py `
+  https://raw.githubusercontent.com/semih44/ugos-llm/main/ugos-llm.py
+
 Get-Content -Raw ugos-llm.py | ssh you@nas-ip "python3 - list"
 Get-Content -Raw ugos-llm.py | ssh you@nas-ip "python3 - check unsloth/Qwen3.5-9B-GGUF"
 ```
 
 ```bash
 # macOS / Linux
+curl -LO https://raw.githubusercontent.com/semih44/ugos-llm/main/ugos-llm.py
 ssh you@nas-ip "python3 - list" < ugos-llm.py
 ```
 
@@ -85,8 +103,9 @@ misleading "No such file or directory".
 
 ### About root/sudo
 
-`check`, `list`, `test` and `doctor` need no privileges. `install`, `remove`
-and `ui` write to root-owned paths; two options:
+`check`, `list`, `test`, `doctor` and `runtime status` need no privileges.
+`install`, `remove`, `ui` and the other `runtime` subcommands write to
+root-owned paths; two options:
 
 - **docker group (recommended, no sudo at all):**
   `sudo usermod -aG docker $USER` once, log out/in — the tool then routes
@@ -107,29 +126,67 @@ intelligent commands): the model degenerates into endless `- - -` / `1. 1. 1.`
 repetition loops, deterministically, while short prompts work fine. UGREEN's
 own RL-tuned 4B masks the issue; virtually any vanilla model exposes it.
 
-**`ugos-llm.py` always configures `-ub 512 -b 512`**, which fixes correctness
-*and* roughly doubles prompt-processing speed (182 vs 91 t/s measured).
+**On the vendor runtime, `ugos-llm.py` always configures `-ub 512 -b 512`**,
+which fixes correctness *and* roughly doubles prompt-processing speed there
+(182 vs 91 t/s measured). Models pinned to an upstream runtime deliberately
+keep `-ub 4096` — that build computes correctly at the larger microbatch and
+is faster for it (see the next section but one).
 Full analysis: [docs/known-bugs.md](docs/known-bugs.md).
 
 ## Compatibility (short version)
 
-| Works | Doesn't |
-|---|---|
-| Dense Qwen3.5 / Qwen3 / Qwen2.5 (tested: Qwen3.5-9B incl. vision) | **Any MoE model** (SYCL build computes garbage — every quant) |
-| Dense Llama 3.x, Gemma 2/3, Mistral (architecture present, untested) | Gemma 4, Qwen 3.6 (architecture missing in b8413) |
-| K-quants (Q4_K_M, Q5_K_M, …) | IQ-quants: unverified, treat as risky |
+Two runtimes, two answers. **Vendor** is the llama.cpp b8413 your NAS ships
+with; **upstream** is a newer build you deploy yourself (next section) and
+that individual models opt into.
+
+| Model class | Vendor runtime (b8413) | Upstream runtime (b10143) |
+|---|---|---|
+| Dense Qwen3.5 | ✅ tested (9B incl. vision + tools) | ✅ expected, untested |
+| Dense Qwen3 / Qwen2.5 / Llama 3.x / Gemma 2-3 / Mistral | ✅ expected, untested | ✅ expected, untested |
+| **Gemma 4** (incl. 26B-A4B) | ❌ architecture not in b8413 | ✅ **tested** — vision, tools, MTP |
+| **MoE** (Qwen3.5-35B-A3B, …) | ❌ token soup, every quant tried | ✅ correct, but slow without MTP |
+| K-quants (Q4_K_M, Q5_K_M, …) | ✅ | ✅ |
+| IQ-quants | ⚠️ unverified | ⚠️ unverified |
+
+These are the verdicts `check` actually prints. Only Gemma 4 and the Qwen
+MoE were re-verified on the upstream build, so dense models sit at
+"expected" there even where the vendor runtime has them as tested.
 
 Details and how to qualify new models: [docs/compatibility.md](docs/compatibility.md).
 
-## Runtime profiles (experimental): newer llama.cpp per model
+## Gemma 4, MoE and MTP: bring your own llama.cpp
 
-Everything in the table above describes UGREEN's shipped build (b8413). A
-current upstream llama.cpp fixes the `-ub 4096` bug, runs MoE models
-correctly and adds MTP speculative decoding (measured: Gemma 4 26B-A4B
-answers structured/JSON prompts *faster* than a dense 9B on the vendor
-build — see [docs/known-bugs.md §6](docs/known-bugs.md)). The `runtime`
-command lets individual models opt in to such a build while every other
-model — including UGREEN's own — keeps running the vendor runtime:
+The shipped b8413 (April 2026 vintage) has no Gemma 4 architecture and
+miscomputes every MoE model. A current upstream llama.cpp fixes both, shows
+no sign of the `-ub 4096` corruption in our tests (a 1.9k-token structured
+prompt and the CLI's long-prompt check both came out correct at `-ub 4096`,
+and twice as fast), and adds **MTP speculative decoding**. Measured
+here on Gemma 4 26B-A4B (Q4 QAT, 14.2 GB, 26B total / ~4B active) against
+the dense Qwen3.5-9B on the vendor runtime:
+
+| Workload (Gemma 4 26B-A4B + MTP) | Generation | Draft acceptance |
+|---|---|---|
+| JSON / structured output | **14.8 t/s** | 79 % |
+| Short answers | 13.4 t/s | 74 % |
+| Free-form prose | 9.9 t/s | 44 % |
+| Long context (2.5k tokens) | 6.3 t/s | 43 % |
+
+For reference, the dense Qwen3.5-9B generates at ~12.3 t/s on the vendor
+runtime. So: a 26B-class model that answers *structured* prompts faster than
+a dense 9B, runs about 20 % slower on free prose, and roughly halves
+throughput at long context — speculative decoding buys nothing where the
+output is unpredictable, because drafts only pay off when they survive
+verification. That sweep was measured in a container; on the self-built
+runtime this project deploys, the JSON case came out at 16.6 t/s at 90 %
+acceptance, with prompt processing at 115.8 t/s over 2.9k tokens.
+
+Bonus: the upstream server's **native tool calling survives the gateway**,
+which b8413 never managed — that is what [openai-bridge/](openai-bridge/)
+exists to work around. Full numbers, and the five traps that cost us a day
+each, are in [docs/known-bugs.md §6](docs/known-bugs.md).
+
+The `runtime` command installs such a build **alongside** the vendor's, so
+every other model — including UGREEN's own — keeps running untouched:
 
 ```bash
 # one-time: deploy a self-built glibc-2.36-compatible runtime, then
@@ -139,7 +196,7 @@ python3 ugos-llm.py runtime deploy /path/to/runtime-dir --name upstream-b10143
 python3 ugos-llm.py runtime enable
 
 # install a model on that runtime, with its MTP draft head; --thinking off
-# reproduces the benchmarked configuration (13-15 t/s structured output)
+# reproduces the benchmarked configuration (16.6 t/s on JSON, see above)
 python3 ugos-llm.py install unsloth/gemma-4-26B-A4B-it-qat-GGUF \
     --quant UD-Q4_K_XL --vision --draft --thinking off \
     --runtime upstream-b10143 --ui --test
@@ -152,10 +209,33 @@ Models opt in via a `.ugos-llm-runtime` marker file in their model
 directory; the dispatcher routes them at spawn time and fails fast if the
 requested runtime is missing (falling back silently would crash on
 upstream-only flags). `doctor` warns when a firmware update has restored
-the vendor wrapper. How to produce such a runtime build is documented in
-[docs/known-bugs.md §6](docs/known-bugs.md) — the short version: build the
-pinned llama.cpp commit with `-DGGML_SYCL=ON` against Ubuntu 22.04
-(glibc ≤ 2.36) and verify no binary needs `GLIBC_2.37+`.
+the vendor wrapper, and `runtime disable` puts the preserved original back.
+
+Producing the runtime itself is one container run —
+[scripts/build-runtime.sh](scripts/build-runtime.sh) pins the exact commit,
+builds against Ubuntu 22.04 for glibc ≤ 2.36, and **fails the build** if any
+binary would need `GLIBC_2.37+` or if a dependency stays unresolved:
+
+```bash
+# fetch the recipe onto the NAS, then build (~30 min, needs ~20 GB scratch)
+mkdir -p /volume1/docker/ugos-llm-build
+curl -Lo /volume1/docker/ugos-llm-build/build-runtime.sh \
+  https://raw.githubusercontent.com/semih44/ugos-llm/main/scripts/build-runtime.sh
+
+docker run --rm -v /volume1/docker/ugos-llm-build:/out \
+  intel/oneapi-basekit:2025.3.2-0-devel-ubuntu22.04 bash /out/build-runtime.sh
+
+# result: /volume1/docker/ugos-llm-build/ugos-llm-runtime-b10143/
+# — that directory is what you hand to `runtime deploy` above
+```
+
+Two build flags are load-bearing and explained in the script: `GGML_SYCL=ON`
+(obviously) and `GGML_SYCL_DNN=OFF` — with oneDNN compiled in, the build
+either crashes or re-JITs kernels on every prompt batch, which drags prompt
+processing from 115 t/s down to under 2.
+
+**This is the experimental part of the project.** It replaces a vendor file
+(after backing it up), and a firmware update can undo it.
 
 ## Safety
 
@@ -180,7 +260,9 @@ This runs with root privileges on your NAS, so it is built defensively:
   temporary directory and swapped in only when complete. A previous
   installation is parked as a rollback copy until the swap succeeds, an
   interrupted swap (power loss) is detected and repaired on the next run, and
-  a lock directory prevents two installs of the same model from colliding.
+  an `flock` prevents two installs of the same model from colliding (the
+  kernel drops it on crash, so a stale lock can never block recovery). The
+  same guarantees apply to `runtime deploy`.
 - **Data files are installed `644`** (no execute bit), directories `755`.
 - This project redistributes **no** UGREEN binaries, models or templates.
   Everything it touches on your NAS stays on your NAS.
@@ -191,14 +273,15 @@ detected and **rejected** rather than half-installed. Pick a single-file quant.
 ## Development
 
 ```bash
-python3 -m unittest discover -s tests -v    # 48 unit tests, stdlib only
+python3 -m unittest discover -s tests -v    # 104 unit tests, stdlib only
 ```
 
 CI runs the suite on Python 3.9 and 3.12 plus a ruff lint. The risky parts —
 name validation, GGUF header parsing, architecture rules, split detection,
-atomic install/rollback and the proxy's rewrite/wrap logic — are covered by
-tests; the NAS-facing parts are verified manually on hardware (see the version
-banner above).
+atomic install/rollback, the runtime dispatcher's routing (executed as real
+bash) and deploy's park-before-replace ordering, plus the proxy's
+rewrite/wrap logic — are covered by tests; the NAS-facing parts are verified
+manually on hardware (see the version banner above).
 
 Known limits, stated plainly: the bridge checks that a synthetic tool call
 carries the schema's *required* top-level keys, but it is **not** a JSON Schema
