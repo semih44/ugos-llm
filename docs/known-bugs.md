@@ -226,6 +226,17 @@ microbatch and quantizing K and V to `q8_0` together were still not enough
 for 16k. On a 32 GB device a 14 GB model simply does not leave room to
 double the context.
 
+Refinement, found while bringing Qwen3.5-9B up at 32k on the upstream
+runtime: the hard wall is the iGPU's **maximum single allocation of just
+under 4 GiB**, not total memory. The attention compute buffer scales with
+`microbatch x context`; at `-c 32768` the device refused exactly 2^33 bytes
+at `-ub 4096` and exactly 2^32 at `-ub 2048` (`can't allocate ... Bytes of
+memory on device`), while `-ub 1024` loads and runs fine — 11.3 t/s
+generation, all four acceptance tests pass, ~14 GiB still available. Rule
+of thumb: when growing `-c`, shrink `-ub` so their product stays where it
+was. This also recasts the Gemma 16k failure above — it may have hit the
+same per-allocation wall rather than exhaustion.
+
 Worth knowing before you chase a bigger number anyway: prompt processing
 runs at ~115 t/s here, so filling 16k costs ~2.5 minutes and 32k ~4.5. The
 practical ceiling on this hardware is set by patience as much as by RAM.

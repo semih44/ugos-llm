@@ -40,16 +40,17 @@ class TestArchRulesPerRuntime(unittest.TestCase):
         # the vendor build loads may come back as UNKNOWN upstream
         rt = "upstream-b10143"
         for arch in ("llama", "gemma2", "gemma3", "mistral", "qwen2",
-                     "qwen3", "phi3", "qwen3_5"):
+                     "qwen3", "phi3"):
             with self.subTest(arch=arch):
                 verdict, why = ug.classify_arch(arch, runtime=rt)
                 self.assertEqual(verdict, "EXPECTED", why)
 
-    def test_dense_models_are_not_tested_upstream(self):
-        # we only ever verified Gemma 4 and the Qwen MoE on this build
+    def test_qwen35_dense_is_tested_upstream(self):
+        # re-verified end-to-end on b10143 (29 Jul 2026): chat, long-prompt,
+        # native tool calls and vision all passed through the gateway
         self.assertEqual(
             ug.classify_arch("qwen3_5", runtime="upstream-b10143")[0],
-            "EXPECTED")
+            "TESTED")
 
     def test_upstream_moe_is_flagged_slow_not_broken(self):
         verdict, why = ug.classify_arch("somethingmoe", runtime="upstream-b10143")

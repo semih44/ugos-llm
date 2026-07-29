@@ -98,7 +98,10 @@ ARCH_KNOWN_MISSING = {"gemma4", "qwen3_6", "qwen36", "glm4moe"}
 # "upstream". Dense models were never re-verified on this build, so they
 # stay EXPECTED here even where the vendor runtime has them as TESTED.
 UPSTREAM_ARCH_TESTED = {"qwen35moe", "gemma4", "gemma4moe",
-                        "gemma4_assistant"}
+                        "gemma4_assistant",
+                        # Qwen3.5-9B re-verified end-to-end on b10143
+                        # (chat/long-prompt/tools/vision, 29 Jul 2026)
+                        "qwen3_5", "qwen35"}
 UPSTREAM_TESTED_RUNTIMES = {"upstream-b10143"}
 
 STATUS = {1: "not installed", 3: "disabled", 8: "active"}
