@@ -645,22 +645,26 @@ exec "$DIR/llama-server.ugreen-orig" "$@"
 def runtime_wrapper_script():
     """Entry point inside a deployed runtime directory.
 
-    Verified on UGOS glibc 2.36 (July 2026): the runtime must bring its own
-    level-zero driver (gpu-l0/, compute-runtime 25.13 is the newest release
-    that still satisfies glibc <= 2.36) and borrows only the IGC/GMM
-    userspace from the vendor bundle — which is why the vendor dir comes
-    AFTER the runtime dir in the library path. The host's own level-zero
-    driver (1.3.x) is too old for 2025-era SYCL, and the vendor's OpenCL
-    path re-JITs kernels on every prompt batch (~2 t/s prompt processing) —
-    both are dead ends; do not "simplify" this back to either.
+    Verified on UGOS glibc 2.36 (July 2026): the runtime reuses UGREEN's
+    own OpenCL GPU userspace (libigdrcl + IGC 2.10 from the vendor bundle)
+    — the maximally native choice, and the only one that works:
+      * the host level-zero driver (1.3.x) is too old for 2025-era SYCL
+        (UR_RESULT_ERROR_UNSUPPORTED_VERSION),
+      * every compute-runtime release new enough for oneDNN needs
+        GLIBC >= 2.38; the newest one that fits glibc (25.13) segfaults
+        under real SYCL compute on this stack,
+      * and the OpenCL path is only fast when llama.cpp is built with
+        -DGGML_SYCL_DNN=OFF — with oneDNN enabled it re-JITs on every
+        prompt batch (~2 t/s prompt processing) or crashes.
+    The vendor dir sits AFTER the runtime dir so our libs always win.
     ggml backends load from the executable's directory; GGML_BACKEND_PATH
     must stay unset (llama.cpp treats it as a file path and fails)."""
     return f"""#!/bin/bash
 # ugos-llm runtime wrapper — managed by ugos-llm.py `runtime deploy`.
 DIR="$(cd "$(dirname "$0")" && pwd)"
 export LD_LIBRARY_PATH="$DIR:{VENDOR_BUNDLE_DIR}${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"
-export ZE_ENABLE_ALT_DRIVERS="$DIR/gpu-l0/libze_intel_gpu.so.1"
-export ONEAPI_DEVICE_SELECTOR="level_zero:0"
+export OCL_ICD_FILENAMES="{VENDOR_BUNDLE_DIR}/libigdrcl.so"
+export ONEAPI_DEVICE_SELECTOR="opencl:gpu"
 exec "$DIR/llama-server" "$@"
 """
 
@@ -1387,11 +1391,10 @@ def runtime_deploy(src_dir, rt_name, force=False):
     if not os.path.isfile(os.path.join(src_dir, "llama-server")):
         die(f"{src_dir} does not look like a built runtime "
             "(no llama-server binary in it).")
-    if not os.path.exists(os.path.join(src_dir, "gpu-l0",
-                                       "libze_intel_gpu.so.1")):
-        log("WARNING: no gpu-l0/libze_intel_gpu.so.1 in the runtime — "
-            "SYCL will find no device on UGOS (host driver too old). "
-            "Bundle compute-runtime <= 25.13 (glibc!) before going live.")
+    if os.path.exists(os.path.join(src_dir, "libdnnl.so.3")):
+        log("WARNING: the runtime bundles oneDNN — on UGREEN's OpenCL "
+            "userspace that build re-JITs every prompt batch or crashes. "
+            "Rebuild with -DGGML_SYCL_DNN=OFF (see docs/known-bugs.md).")
     target = os.path.join(RUNTIMES_DIR, rt_name)
     if os.path.exists(target) and not force:
         die(f"{target} already exists (use --force to replace).")
