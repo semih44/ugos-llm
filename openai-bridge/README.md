@@ -61,6 +61,52 @@ Emulated requests get `stream` removed (the answer must be buffered to be
 wrapped) and `max_tokens` clamped to `MAX_TOKENS` — a **hard cap**, larger
 client values are reduced.
 
+## Reaching it from another machine (and locking it down)
+
+The gateway has **no authentication of its own**, so the moment you bind
+this bridge to something your LAN can reach, every device on the network can
+use your model. The bridge therefore **refuses to start** on a non-local
+address unless `API_KEY` is set:
+
+```
+openai-bridge: refusing to bind '192.168.1.221' without authentication.
+```
+
+Set a key and it becomes the authentication boundary — it validates
+`Authorization: Bearer <key>` in constant time, answers `401` otherwise, and
+does not pass the client's credential upstream:
+
+```bash
+docker run -d --name ugos-llm-bridge --restart unless-stopped \
+  --network host \
+  -v /volume1/docker/ugos-llm-bridge:/bridge:ro \
+  -e LISTEN_HOST=192.168.1.221 \
+  -e LISTEN_PORT=11436 \
+  -e API_KEY="$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))')" \
+  -e MAX_TOKENS=4096 \
+  python:3.12-alpine python3 /bridge/proxy.py
+```
+
+Run this as a **second** instance rather than re-purposing a container your
+apps already depend on. `ALLOW_UNAUTHENTICATED=1` exists to override the
+guard; there is no good reason to use it.
+
+### VS Code (Copilot BYOK, "Custom Endpoint")
+
+`Chat: Manage Language Models` → **Custom Endpoint**, base URL
+`http://<nas-ip>:11436/v1`, the API key from above, model id
+`Gemma4-26B-A4B/Gemma4-26B-A4B`. Works without a GitHub account or Copilot
+plan. Streaming and native tool calls both survive the chain — verified
+end-to-end from a MacBook.
+
+Two limits worth knowing before you set expectations. **Inline completions
+are out of reach**: VS Code's docs state plainly that "you cannot connect to
+a local model for inline suggestions" — BYOK drives chat only, so no amount
+of server-side work produces ghost text. And **agent-style extensions will
+struggle**: the gateway serialises at `-np 1`, and a model configured with
+an 8k context runs out of room quickly once an agent starts passing files
+around.
+
 ## Ops notes
 
 - One log line per request (`docker logs llm-bridge`). Healthy:
@@ -68,7 +114,8 @@ client values are reduced.
   `[tools-passthrough]` means auto/none went straight to the gateway.
   `wrap-failed:*` means the model answered non-JSON — the client then gets an
   honest **HTTP 502**, never a silent bad result.
+  `[unauthorized] -> 401 from <ip>` logs the caller's address.
 - Requests larger than `MAX_BODY` (32 MiB) are rejected with 413.
 - The gateway serializes per model (`-np 1`): parallel callers queue.
-- Environment: `LISTEN_HOST`, `LISTEN_PORT`, `UPSTREAM`, `MAX_TOKENS`,
-  `TIMEOUT`, `MAX_BODY`.
+- Environment: `LISTEN_HOST`, `LISTEN_PORT`, `UPSTREAM`, `API_KEY`,
+  `ALLOW_UNAUTHENTICATED`, `MAX_TOKENS`, `TIMEOUT`, `MAX_BODY`.

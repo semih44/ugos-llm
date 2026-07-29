@@ -19,11 +19,21 @@ What it does, and only when tool use is actually FORCED
 gateway handles those natively. Non-tool requests, including streaming, are
 proxied verbatim.
 
+The gateway itself has NO authentication, so if you bind this bridge
+anywhere reachable from your network, set API_KEY — the bridge then becomes
+the authentication boundary and refuses to start on a non-local address
+without one.
+
 Configuration (env):
   LISTEN_HOST   default 172.17.0.1  (docker bridge IP: reachable by
                 containers, not by your LAN)
   LISTEN_PORT   default 11434
   UPSTREAM      default http://127.0.0.1:62891
+  API_KEY       default empty (no auth). When set, every request must carry
+                `Authorization: Bearer <key>`. Required to bind anything
+                other than loopback or a docker bridge address.
+  ALLOW_UNAUTHENTICATED  set to 1 to bind a LAN address without a key.
+                Do not. It publishes an open LLM endpoint to your network.
   MAX_TOKENS    default 1024   (hard cap, clamps larger client values)
   TIMEOUT       default 570    (seconds; keep below your client timeout)
   MAX_BODY      default 33554432 (32 MiB request limit)
@@ -32,6 +42,8 @@ Run with network_mode: host (see README.md). One log line per request.
 
 License: MIT.
 """
+import hmac
+import ipaddress
 import json
 import os
 import time
@@ -42,6 +54,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 LISTEN = (os.environ.get("LISTEN_HOST", "172.17.0.1"),
           int(os.environ.get("LISTEN_PORT", "11434")))
 UPSTREAM = os.environ.get("UPSTREAM", "http://127.0.0.1:62891").rstrip("/")
+API_KEY = os.environ.get("API_KEY", "")
+ALLOW_UNAUTHENTICATED = (os.environ.get("ALLOW_UNAUTHENTICATED", "").lower()
+                         not in ("", "0", "false", "no"))
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "1024"))
 TIMEOUT = int(os.environ.get("TIMEOUT", "570"))
 MAX_BODY = int(os.environ.get("MAX_BODY", str(32 * 1024 * 1024)))
@@ -62,6 +77,61 @@ MULTI_INSTR = (
 
 class BadRequest(ValueError):
     """Client sent something we can answer with a clean HTTP 400."""
+
+
+def check_auth(header, key):
+    """May this request proceed?
+
+    An empty key disables authentication entirely — that is the shipped
+    default and what the docker-only deployment relies on. With a key set,
+    exactly one shape is accepted: `Authorization: Bearer <key>`. Being
+    strict here is deliberate: silently accepting a bare key or another
+    scheme would make a misconfigured client look like it works.
+    """
+    if not key:
+        return True
+    if not header:
+        return False
+    scheme, _, token = header.partition(" ")
+    if scheme.lower() != "bearer" or not token:
+        return False
+    # bytes, not str: compare_digest rejects non-ASCII str outright, and a
+    # plain == would leak the key's length and prefix through timing
+    return hmac.compare_digest(token.encode("utf-8"), key.encode("utf-8"))
+
+
+def _is_local_bind(host):
+    """True for addresses only this machine (or its containers) can reach."""
+    if host == "localhost":
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False                      # "" and 0.0.0.0-style wildcards
+    if ip.is_loopback:
+        return True
+    # docker bridge networks: reachable by containers on this host but not
+    # from the LAN. This is the shipped default and must keep working.
+    return ip.version == 4 and ip in ipaddress.ip_network("172.16.0.0/12")
+
+
+def guard_bind(host, key, allow_unauth):
+    """Refuse to publish an unauthenticated LLM endpoint to the network.
+
+    The upstream gateway has no authentication of its own, so binding this
+    bridge to a LAN address without a key hands every device on the network
+    a free, unmetered model. Raises SystemExit rather than warning, because
+    a warning in a container log is a warning nobody reads.
+    """
+    if key or allow_unauth or _is_local_bind(host):
+        return
+    raise SystemExit(
+        f"openai-bridge: refusing to bind {host!r} without authentication.\n"
+        f"  The UGOS gateway has no auth, so this would expose an open LLM "
+        f"endpoint to your network.\n"
+        f"  Set API_KEY=<something long and random> and send it as "
+        f"'Authorization: Bearer <key>',\n"
+        f"  or set ALLOW_UNAUTHENTICATED=1 if you genuinely want this.")
 
 
 def scrub_schema(node, in_properties=False):
@@ -236,12 +306,23 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    def _send(self, status, payload, ctype="application/json"):
+    def _send(self, status, payload, ctype="application/json", extra=()):
         self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(payload)))
+        for k, v in extra:
+            self.send_header(k, v)
         self.end_headers()
         self.wfile.write(payload)
+
+    def _unauthorized(self):
+        self._send(401, json.dumps(
+            {"error": {"message": "missing or invalid API key",
+                       "type": "invalid_request_error",
+                       "code": "invalid_api_key"}}).encode(),
+            extra=(("WWW-Authenticate", 'Bearer realm="openai-bridge"'),))
+        print(f"{self.command} {self.path} [unauthorized] -> 401 "
+              f"from {self.client_address[0]}", flush=True)
 
     def _proxy(self, body=None):
         t0 = time.time()
@@ -265,7 +346,11 @@ class Handler(BaseHTTPRequestHandler):
                 return
         req = urllib.request.Request(UPSTREAM + self.path, data=body,
                                      method=self.command)
-        for h in ("Content-Type", "Authorization", "Accept"):
+        # When we authenticate, we ARE the boundary: the client's credential
+        # is ours to check and stops here rather than travelling upstream.
+        forward = ("Content-Type", "Accept") if API_KEY \
+            else ("Content-Type", "Authorization", "Accept")
+        for h in forward:
             if self.headers.get(h):
                 req.add_header(h, self.headers[h])
         status = 502
@@ -324,9 +409,15 @@ class Handler(BaseHTTPRequestHandler):
               f"in {time.time()-t0:.1f}s", flush=True)
 
     def do_GET(self):
+        if not check_auth(self.headers.get("Authorization"), API_KEY):
+            self._unauthorized()
+            return
         self._proxy()
 
     def do_POST(self):
+        if not check_auth(self.headers.get("Authorization"), API_KEY):
+            self._unauthorized()
+            return
         try:
             n = int(self.headers.get("Content-Length", 0) or 0)
         except ValueError:
@@ -343,7 +434,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    print(f"openai-bridge {LISTEN} -> {UPSTREAM} "
+    guard_bind(LISTEN[0], API_KEY, ALLOW_UNAUTHENTICATED)
+    auth = "API key required" if API_KEY else "NO AUTH"
+    print(f"openai-bridge {LISTEN} -> {UPSTREAM} [{auth}] "
           f"(max_tokens cap {MAX_TOKENS}, body limit {MAX_BODY//1048576} MiB)",
           flush=True)
     ThreadingHTTPServer(LISTEN, Handler).serve_forever()
