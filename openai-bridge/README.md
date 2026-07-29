@@ -117,6 +117,13 @@ around.
   `[unauthorized] -> 401 from <ip>` logs the caller's address.
 - Requests larger than `MAX_BODY` (32 MiB) are rejected with 413.
 - The gateway serializes per model (`-np 1`): parallel callers queue.
+- An OpenAI-style `reasoning_effort` in the request (what VS Code's
+  thinking-effort picker sends with `"reasoningEffortFormat":
+  "chat-completions"`) is translated to `enable_thinking`:
+  `none`/`minimal`/`low` → off, `medium` and up → on, unknown values fall
+  back to `THINKING_DEFAULT`. Precedence per request: client
+  `chat_template_kwargs` > `reasoning_effort` > `THINKING_DEFAULT` — and
+  tool emulation pins thinking off above all of them.
 - `THINKING_DEFAULT=on|off` injects `chat_template_kwargs:
   {"enable_thinking": …}` into chat requests that don't carry their own —
   request-level is the only level that works: the UGOS gateway swallows

@@ -62,6 +62,27 @@ API_KEY = os.environ.get("API_KEY", "")
 # chat_template_kwargs demonstrably win. Clients that send their own kwargs
 # always take precedence; emulated tool requests are always pinned off.
 THINKING_DEFAULT = os.environ.get("THINKING_DEFAULT", "").lower()
+
+# OpenAI-style reasoning_effort (what VS Code's thinking-effort picker
+# sends) mapped onto Qwen's binary enable_thinking. Unknown values fall
+# back to THINKING_DEFAULT rather than guessing.
+EFFORT_OFF = {"none", "minimal", "low"}
+EFFORT_ON = {"medium", "high", "xhigh", "max"}
+
+
+def thinking_kwargs(data):
+    """The chat_template_kwargs to inject for a plain chat request, or None
+    to leave the request untouched. Client-supplied kwargs always win."""
+    if "chat_template_kwargs" in data:
+        return None
+    effort = str(data.get("reasoning_effort", "")).lower()
+    if effort in EFFORT_ON:
+        return {"enable_thinking": True}
+    if effort in EFFORT_OFF:
+        return {"enable_thinking": False}
+    if THINKING_DEFAULT in ("on", "off"):
+        return {"enable_thinking": THINKING_DEFAULT == "on"}
+    return None
 ALLOW_UNAUTHENTICATED = (os.environ.get("ALLOW_UNAUTHENTICATED", "").lower()
                          not in ("", "0", "false", "no"))
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "1024"))
@@ -216,12 +237,12 @@ def rewrite(body, path):
     p = plan(data)
     if p is None:
         note = "tools-passthrough" if data.get("tools") else "-"
-        if THINKING_DEFAULT in ("on", "off") \
-                and "chat_template_kwargs" not in data:
-            data["chat_template_kwargs"] = {
-                "enable_thinking": THINKING_DEFAULT == "on"}
+        kw = thinking_kwargs(data)
+        if kw is not None:
+            data["chat_template_kwargs"] = kw
+            state = "think" if kw["enable_thinking"] else "nothink"
             return (json.dumps(data).encode("utf-8"),
-                    note + f",think-{THINKING_DEFAULT}", None)
+                    note + f",{state}", None)
         return body, note, None
 
     kind, payload = p

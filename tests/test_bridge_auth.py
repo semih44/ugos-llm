@@ -169,6 +169,53 @@ class TestThinkingDefault(unittest.TestCase):
         self.assertEqual(data["chat_template_kwargs"],
                          {"enable_thinking": False})
 
+    def test_reasoning_effort_low_beats_default_on(self):
+        # VS Code's thinking-effort picker sends reasoning_effort — the
+        # per-question choice must override the instance default
+        px.THINKING_DEFAULT = "on"
+        data, _ = self._rw(dict(self.base, reasoning_effort="low"))
+        self.assertEqual(data["chat_template_kwargs"],
+                         {"enable_thinking": False})
+
+    def test_reasoning_effort_high_beats_default_off(self):
+        px.THINKING_DEFAULT = "off"
+        data, _ = self._rw(dict(self.base, reasoning_effort="high"))
+        self.assertEqual(data["chat_template_kwargs"],
+                         {"enable_thinking": True})
+
+    def test_all_documented_effort_levels_map(self):
+        px.THINKING_DEFAULT = ""
+        for eff, expect in (("none", False), ("minimal", False),
+                            ("low", False), ("medium", True),
+                            ("high", True), ("xhigh", True), ("max", True)):
+            with self.subTest(effort=eff):
+                data, _ = self._rw(dict(self.base, reasoning_effort=eff))
+                self.assertEqual(
+                    data["chat_template_kwargs"]["enable_thinking"], expect)
+
+    def test_unknown_effort_falls_back_to_default(self):
+        px.THINKING_DEFAULT = "on"
+        data, _ = self._rw(dict(self.base, reasoning_effort="turbo"))
+        self.assertEqual(data["chat_template_kwargs"],
+                         {"enable_thinking": True})
+
+    def test_client_kwargs_beat_reasoning_effort(self):
+        px.THINKING_DEFAULT = ""
+        data, _ = self._rw(dict(
+            self.base, reasoning_effort="high",
+            chat_template_kwargs={"enable_thinking": False}))
+        self.assertEqual(data["chat_template_kwargs"],
+                         {"enable_thinking": False})
+
+    def test_effort_cannot_unpin_tool_emulation(self):
+        px.THINKING_DEFAULT = "on"
+        data, plan = self._rw(dict(self.base, tools=[self.TOOL],
+                                   tool_choice="required",
+                                   reasoning_effort="high"))
+        self.assertIsNotNone(plan)
+        self.assertEqual(data["chat_template_kwargs"],
+                         {"enable_thinking": False})
+
 
 class TestBindGuard(unittest.TestCase):
     """Refusing to start is the only reliable way to stop someone putting an
