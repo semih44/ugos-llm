@@ -55,6 +55,13 @@ LISTEN = (os.environ.get("LISTEN_HOST", "172.17.0.1"),
           int(os.environ.get("LISTEN_PORT", "11434")))
 UPSTREAM = os.environ.get("UPSTREAM", "http://127.0.0.1:62891").rstrip("/")
 API_KEY = os.environ.get("API_KEY", "")
+# "on" | "off" | "" (leave requests alone). Injected at request level
+# because that is the only level that reliably reaches the model: the UGOS
+# gateway swallows llama-server's own --chat-template-kwargs default
+# (verified: argv intact, /props kwargs empty), while request-level
+# chat_template_kwargs demonstrably win. Clients that send their own kwargs
+# always take precedence; emulated tool requests are always pinned off.
+THINKING_DEFAULT = os.environ.get("THINKING_DEFAULT", "").lower()
 ALLOW_UNAUTHENTICATED = (os.environ.get("ALLOW_UNAUTHENTICATED", "").lower()
                          not in ("", "0", "false", "no"))
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "1024"))
@@ -208,7 +215,14 @@ def rewrite(body, path):
         return body, "no-json", None
     p = plan(data)
     if p is None:
-        return body, ("tools-passthrough" if data.get("tools") else "-"), None
+        note = "tools-passthrough" if data.get("tools") else "-"
+        if THINKING_DEFAULT in ("on", "off") \
+                and "chat_template_kwargs" not in data:
+            data["chat_template_kwargs"] = {
+                "enable_thinking": THINKING_DEFAULT == "on"}
+            return (json.dumps(data).encode("utf-8"),
+                    note + f",think-{THINKING_DEFAULT}", None)
+        return body, note, None
 
     kind, payload = p
     if kind == "single":
@@ -229,6 +243,10 @@ def rewrite(body, path):
     data.pop("tools", None)
     data.pop("tool_choice", None)
     data.pop("parallel_tool_calls", None)
+    # Emulated requests are budget-capped JSON extractions. If the server's
+    # default is enable_thinking:true, reasoning would eat that budget before
+    # any JSON appears — pin it off here, unless the client asked otherwise.
+    data.setdefault("chat_template_kwargs", {"enable_thinking": False})
     msgs = data.get("messages")
     if not isinstance(msgs, list):
         raise BadRequest("'messages' must be an array")

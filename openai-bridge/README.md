@@ -117,5 +117,14 @@ around.
   `[unauthorized] -> 401 from <ip>` logs the caller's address.
 - Requests larger than `MAX_BODY` (32 MiB) are rejected with 413.
 - The gateway serializes per model (`-np 1`): parallel callers queue.
+- `THINKING_DEFAULT=on|off` injects `chat_template_kwargs:
+  {"enable_thinking": …}` into chat requests that don't carry their own —
+  request-level is the only level that works: the UGOS gateway swallows
+  llama-server's own `--chat-template-kwargs` default (verified: argv
+  intact, `/props` kwargs empty), while request-level kwargs win. Clients
+  that send their own kwargs always take precedence, and **emulated tool
+  requests are always pinned to thinking-off** regardless of this setting —
+  reasoning would burn their capped token budget before any JSON appears.
 - Environment: `LISTEN_HOST`, `LISTEN_PORT`, `UPSTREAM`, `API_KEY`,
-  `ALLOW_UNAUTHENTICATED`, `MAX_TOKENS`, `TIMEOUT`, `MAX_BODY`.
+  `ALLOW_UNAUTHENTICATED`, `THINKING_DEFAULT`, `MAX_TOKENS`, `TIMEOUT`,
+  `MAX_BODY`.

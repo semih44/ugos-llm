@@ -258,6 +258,14 @@ also shortens the queue when several clients share the `-np 1` slot.
   `/var/ugreen/log/infer_gateway_serv_panic/` — the files are not panics.
 - The gateway exposes fragments of an Ollama API (`/api/tags` returns an
   empty list; `/api/chat` accepts requests and never answers). Ignore it.
+- A server-side `--chat-template-kwargs` default can be swallowed on the
+  gateway path: with Qwen3.5-9B the flag arrives intact in the spawned
+  server's argv, yet `/props` reports empty kwargs and requests without
+  their own `chat_template_kwargs` behave as if no default were set —
+  while the same flag did take effect for Gemma 4. Request-level kwargs
+  win in every case, so set thinking defaults at the request level (the
+  bridge's `THINKING_DEFAULT` does exactly that) rather than in
+  `extra_args` if you need them to hold.
 - `scp` to the NAS fails with a misleading "No such file or directory"
   unless the SFTP service is enabled in UGOS (Control Panel → Terminal).
 - UGOS's root filesystem is immutable — even root cannot `mkdir /home/x`.
