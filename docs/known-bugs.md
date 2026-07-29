@@ -176,6 +176,33 @@ faithful summary, valid JSON — dates not ISO-normalized unless asked).
 Untuned knobs worth a look: `--spec-draft-n-max` below 4 might soften the
 long-context penalty.
 
+**Native deployment (verified end-to-end, July 2026).** The b10143 commit
+built via [scripts/build-runtime.sh](../scripts/build-runtime.sh) runs
+natively under the UGOS gateway (`runtime deploy` + `runtime enable` +
+`install --runtime upstream-b10143 --draft`): the Model Manager card
+loads Gemma 4 26B-A4B through the dispatcher, all four acceptance tests
+pass (chat, long-prompt at `-ub 4096`, tools, vision), and the gateway
+even returns **real `tool_calls`** — the upstream server's native
+tool-calling survives the gateway pipeline, which b8413 never managed.
+Measured on the isolated runtime: PP 115.8 t/s at 2.9k tokens, JSON
+16.6 t/s at 90 % draft acceptance. The traps below cost a day each to
+find and are baked into wrapper + build script; the full story:
+
+1. Every GPU userspace new enough for oneDNN needs GLIBC ≥ 2.38 (host
+   level-zero 1.3.x is too old, compute-runtime ≥ 25.18 too new, 25.13
+   segfaults under SYCL compute). The way out: build with
+   `-DGGML_SYCL_DNN=OFF` and run on **UGREEN's own OpenCL userspace**
+   (igdrcl + IGC 2.10 from the vendor bundle).
+2. With oneDNN compiled in, the OpenCL path re-JITs kernels on every
+   prompt batch: 0.4–2 t/s prompt processing. Without it: 115 t/s.
+3. `/etc/OpenCL/vendors` registers UGOS' old system driver — the same
+   iGPU appears twice and ggml's multi-GPU peer-access path crashes the
+   OpenCL adapter. The wrapper points `OCL_ICD_VENDORS` into the void.
+4. `GGML_BACKEND_PATH` is treated as a file path by llama.cpp — leave it
+   unset; backends load from the executable's directory.
+5. Bonus: unsloth qat GGUFs carry > 4 MB of header metadata; fixed-size
+   header probes must widen their byte range.
+
 ---
 
 ## 7. Assorted smaller surprises
