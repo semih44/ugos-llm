@@ -240,6 +240,12 @@ class TestRuntimeWrapper(unittest.TestCase):
         # host L0 too old, glibc-compatible L0 segfaults — OpenCL is the way
         self.assertNotIn("ZE_ENABLE_ALT_DRIVERS", w)
 
+    def test_system_icds_are_blocked(self):
+        # /etc/OpenCL/vendors would add UGOS' old driver as a second device
+        # and trip ggml's crashing multi-GPU peer-access path
+        w = ug.runtime_wrapper_script()
+        self.assertIn('OCL_ICD_VENDORS="$DIR/.no-system-icds"', w)
+
 
 class TestHeaderProbeRetry(unittest.TestCase):
     """qat GGUFs carry >4 MB of metadata — the probe must widen its byte

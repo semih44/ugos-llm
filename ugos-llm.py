@@ -668,6 +668,11 @@ def runtime_wrapper_script():
 # ugos-llm runtime wrapper — managed by ugos-llm.py `runtime deploy`.
 DIR="$(cd "$(dirname "$0")" && pwd)"
 export LD_LIBRARY_PATH="$DIR:{VENDOR_BUNDLE_DIR}${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"
+# Exactly ONE OpenCL ICD: point the vendors dir into the void so the ICD
+# loader skips /etc/OpenCL/vendors (UGOS registers its old system driver
+# there — a second device triggers ggml's multi-GPU peer-access path,
+# which crashes in the OpenCL adapter).
+export OCL_ICD_VENDORS="$DIR/.no-system-icds"
 export OCL_ICD_FILENAMES="{VENDOR_BUNDLE_DIR}/libigdrcl.so"
 export ONEAPI_DEVICE_SELECTOR="opencl:gpu"
 exec "$DIR/llama-server" "$@"
