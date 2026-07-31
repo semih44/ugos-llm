@@ -107,6 +107,26 @@ class BadRequest(ValueError):
     """Client sent something we can answer with a clean HTTP 400."""
 
 
+def auth_shape(headers):
+    """Describe how a rejected request tried to authenticate — scheme and
+    length only, never the value. This is what turns 'my client gets 401'
+    from guesswork into a one-line log read."""
+    auth = headers.get("Authorization")
+    api = headers.get("api-key") or headers.get("Api-Key")
+    if not auth and not api:
+        return "no-auth-header"
+    parts = []
+    if auth:
+        scheme, _, token = auth.partition(" ")
+        if token:
+            parts.append(f"Authorization={scheme},len={len(token)}")
+        else:
+            parts.append(f"Authorization=bare,len={len(scheme)}")
+    if api:
+        parts.append(f"api-key,len={len(api)}")
+    return " ".join(parts)
+
+
 def check_auth(header, key):
     """May this request proceed?
 
@@ -361,7 +381,8 @@ class Handler(BaseHTTPRequestHandler):
                        "code": "invalid_api_key"}}).encode(),
             extra=(("WWW-Authenticate", 'Bearer realm="openai-bridge"'),))
         print(f"{self.command} {self.path} [unauthorized] -> 401 "
-              f"from {self.client_address[0]}", flush=True)
+              f"from {self.client_address[0]} "
+              f"({auth_shape(self.headers)})", flush=True)
 
     def _proxy(self, body=None):
         t0 = time.time()

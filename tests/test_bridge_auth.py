@@ -217,6 +217,31 @@ class TestThinkingDefault(unittest.TestCase):
                          {"enable_thinking": False})
 
 
+class TestAuthShape(unittest.TestCase):
+    """401 diagnostics must describe the attempt without leaking the key."""
+
+    def test_missing_header(self):
+        self.assertEqual(px.auth_shape({}), "no-auth-header")
+
+    def test_bearer_shape(self):
+        s = px.auth_shape({"Authorization": "Bearer abcdef"})
+        self.assertEqual(s, "Authorization=Bearer,len=6")
+
+    def test_bare_token_shape(self):
+        s = px.auth_shape({"Authorization": "abcdefgh"})
+        self.assertEqual(s, "Authorization=bare,len=8")
+
+    def test_api_key_header_shape(self):
+        s = px.auth_shape({"api-key": "xyz"})
+        self.assertEqual(s, "api-key,len=3")
+
+    def test_never_contains_the_secret(self):
+        secret = "SuperGeheim123"
+        for h in ({"Authorization": f"Bearer {secret}"},
+                  {"Authorization": secret}, {"api-key": secret}):
+            self.assertNotIn(secret, px.auth_shape(h))
+
+
 class TestBindGuard(unittest.TestCase):
     """Refusing to start is the only reliable way to stop someone putting an
     unauthenticated LLM endpoint on their LAN."""
