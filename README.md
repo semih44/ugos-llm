@@ -264,7 +264,7 @@ individual models opt into.
 
 | Model class | Vendor runtime (b8413) | Upstream runtime (b10143) |
 |---|---|---|
-| Dense Qwen3.5 | ✅ tested (9B incl. vision + tools) | ✅ expected, untested |
+| Dense Qwen3.5 | ✅ tested (9B incl. vision + tools) | ✅ **tested** — 64k ctx, native tools, vision |
 | Dense Qwen3 / Qwen2.5 / Llama 3.x / Gemma 2-3 / Mistral | ✅ expected, untested | ✅ expected, untested |
 | **Gemma 4** (incl. 26B-A4B) | ❌ architecture not in b8413 | ✅ **tested** — vision, tools, MTP |
 | **MoE** (Qwen3.5-35B-A3B, …) | ❌ token soup, every quant tried | ✅ correct, but slow without MTP |

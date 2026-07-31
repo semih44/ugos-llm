@@ -93,19 +93,46 @@ guard; there is no good reason to use it.
 
 ### VS Code (Copilot BYOK, "Custom Endpoint")
 
-`Chat: Manage Language Models` → **Custom Endpoint**, base URL
-`http://<nas-ip>:11436/v1`, the API key from above, model id
-`Gemma4-26B-A4B/Gemma4-26B-A4B`. Works without a GitHub account or Copilot
-plan. Streaming and native tool calls both survive the chain — verified
-end-to-end from a MacBook.
+Works without a GitHub account or Copilot plan. Streaming, native tool
+calls and vision all survive the chain — verified end-to-end from a
+MacBook. Two hard-won rules:
 
-Two limits worth knowing before you set expectations. **Inline completions
-are out of reach**: VS Code's docs state plainly that "you cannot connect to
-a local model for inline suggestions" — BYOK drives chat only, so no amount
-of server-side work produces ghost text. And **agent-style extensions will
-struggle**: the gateway serialises at `-np 1`, and a model configured with
-an 8k context runs out of room quickly once an agent starts passing files
-around.
+1. **The API key must go through VS Code's wizard** (`Chat: Manage
+   Language Models` → Add Models → Custom Endpoint): the wizard stores it
+   in the OS keychain and writes a `${input:chat.lm.secret.<id>}`
+   reference into `chatLanguageModels.json`. A key typed into that file
+   by hand is **silently invalid** — the provider then sends a short
+   placeholder instead (our 401 log showed `Authorization=bare,len=6`),
+   and nothing in VS Code tells you why.
+2. The wizard's stub has empty model fields; fill them in the file it
+   opens. A working example, including the **thinking-effort picker**
+   (VS Code then sends `reasoning_effort`, which this bridge translates
+   to `enable_thinking` — see above):
+
+```json
+"models": [{
+    "id": "Qwen3.5-9B/Qwen3.5-9B",
+    "name": "Qwen 3.5 9B (NAS, 64k)",
+    "url": "http://<nas-ip>:11436/v1/chat/completions",
+    "toolCalling": true,
+    "vision": true,
+    "thinking": true,
+    "supportsReasoningEffort": ["low", "high"],
+    "reasoningEffortFormat": "chat-completions",
+    "maxInputTokens": 58000,
+    "maxOutputTokens": 4096
+}]
+```
+
+Keep `maxInputTokens + maxOutputTokens` below the server's `-c` — Copilot
+fills whatever you allow, and a 44k-token agent-mode prompt costs ~4
+minutes of prefill on an iDX6011 (follow-ups hit the prompt cache).
+
+One limit is not fixable from our side: **inline completions**. VS Code's
+docs state plainly that "you cannot connect to a local model for inline
+suggestions" — BYOK drives chat only, and Gemma 4 / Qwen chat models
+carry no FIM tokens anyway (llama-server's `/infill` refuses them
+with 501).
 
 ## Ops notes
 

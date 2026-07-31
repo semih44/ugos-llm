@@ -29,16 +29,17 @@ latter.
 | Architecture | Verdict | Notes |
 |---|---|---|
 | `gemma4` (incl. 26B-A4B MoE) | ✅ **TESTED** | end-to-end through the gateway: chat, long prompts at `-ub 4096`, **native tool calls**, vision, MTP draft head |
+| `qwen3_5` dense | ✅ **TESTED** | Qwen3.5-9B re-verified end-to-end on this build (Jul 2026): chat, long-prompt, native tool calls, vision — running at `-c 65536 -ub 512` |
 | `qwen35moe` and MoE generally | ✅ correct | no more token soup — but generation is SYCL-kernel-bound (~7 t/s for a 35B-A3B); only worth it with an MTP head |
-| every architecture the vendor build loads (`qwen3_5`, `qwen3`, `qwen2`, `llama`, `gemma`–`gemma3n`, `mistral`, `phi3`) | ✅ expected | a newer llama.cpp is an architectural superset of b8413, so these are present — but none was re-verified on this build, so none is TESTED here |
+| every other architecture the vendor build loads (`qwen3`, `qwen2`, `llama`, `gemma`–`gemma3n`, `mistral`, `phi3`) | ✅ expected | a newer llama.cpp is an architectural superset of b8413, so these are present — just not re-verified on this build |
 | anything else | ⚠️ unknown | `check --runtime` reports UNKNOWN — install and run `test` |
 
-Two deliberate conservatisms in these verdicts. `TESTED` is granted only for
+One deliberate conservatism in these verdicts: `TESTED` is granted only for
 the exact runtime build we verified — deploy a different one and `check`
 downgrades to `EXPECTED`, because a name like `upstream-…` proves nothing
-about what was compiled in. And dense models stay at `EXPECTED` upstream
-even where the vendor column says `TESTED`: the verification happened on
-b8413, and we did not repeat it here.
+about what was compiled in. Architectures earn their upstream `TESTED` the
+same way they earn the vendor one: somebody runs the full `test` suite on
+this hardware and reports it (as happened for Qwen3.5-9B in July 2026).
 
 ## Quantization guidance
 
@@ -68,6 +69,14 @@ helps in proportion to how predictable the output is. Those four are one
 coherent sweep measured in a container; the self-built runtime reached
 16.6 t/s on JSON and 115.8 t/s prompt processing over 2.9k tokens. Loading
 the model takes ~28 s.
+
+Qwen3.5-9B on the upstream runtime at `-c 65536 -ub 512` (July 2026):
+~11.3 t/s generation at small context, prompt processing a steady
+**179–190 t/s even across a 44k-token prompt** — but plan for the two
+long-context realities: filling 44k takes ~4 minutes on the first shot
+(follow-ups reuse the prompt cache and only pay for the delta), and
+generation **degrades to ~4.7 t/s once ~44k of context is resident**,
+because attention over the long history dominates. Loading takes ~26 s.
 
 One sizing trap on 32 GB devices: UGOS' own task scheduler refuses to start
 an Uliya job unless *available* RAM exceeds the model's **file size** (a
