@@ -221,6 +221,29 @@ non-configurable* 2-minute readiness timeout — `server on unix socket … not
 ready after 240 attempts (2m0s)` — after which the gateway kills it. A
 warm SYCL JIT cache on the second attempt does not save it.
 
+The full FA verdict, measured later on Qwen3.5-9B (July 2026). The load
+problem is actually *solvable*: FA kernel compilation took 137 s — 17 s
+over the gateway's window — but the gateway sets `HOME` to the model dir's
+`infer_gateway_cache/`, and **warming that cache by running the same
+llama-server once OUTSIDE the gateway** (own container, same runtime, same
+OpenCL stack, `HOME` pointed at that directory, no time limit) brought the
+subsequent gateway load down to 13 s. Remember this trick — it applies to
+anything whose first load busts the 2-minute window.
+
+Then the benchmark killed the idea anyway. Identical ~14k-token prompt,
+`-c 65536 -ub 512`, same runtime:
+
+| | `-fa off` | `-fa on` (2 runs) |
+|---|---|---|
+| prompt processing | **221.8 t/s** | 100.8 / 86.8 t/s |
+| generation at ~14k ctx | 7.34 t/s | 7.97 / 7.39 t/s |
+
+FA on this SYCL/OpenCL path **halves prompt processing and buys nothing on
+generation** — the attention kernels are clearly unoptimized for this
+iGPU. Since prefill dominates every large-context request, `-fa on` makes
+the box strictly worse. Keep `-fa off`; re-measure after major llama.cpp
+SYCL releases before believing otherwise.
+
 And the ceiling is the **compute buffers**, not the KV cache: halving the
 microbatch and quantizing K and V to `q8_0` together were still not enough
 for 16k. On a 32 GB device a 14 GB model simply does not leave room to
