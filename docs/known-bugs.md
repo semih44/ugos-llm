@@ -298,6 +298,39 @@ Arc dGPU (discussion #26184) and IQ3-class quants regress hard with MTP
 box, and roughly half the speed of the dense 9B at everything
 interactive. We installed it, measured it, and removed it again.
 
+**Qwen3.5-9B with its embedded MTP head: slower, not faster (b10621,
+August 2026).** unsloth ships `Qwen3.5-9B-MTP-GGUF` — identical weights
+plus a multi-token-prediction head baked into the GGUF, enabled with
+`--spec-type draft-mtp --spec-draft-n-max 4` (no separate draft file;
+b10621 autodetects the head). All four acceptance tests pass with it,
+including vision — MTP and `--mmproj` do coexist, whatever older model
+cards say. But the speed went the wrong way, measured against the plain
+9B through the same gateway:
+
+| workload | plain 9B | 9B + MTP | draft acceptance |
+|---|---|---|---|
+| JSON extraction (390 tok) | 11.1 t/s | **5.7 t/s** | 78 %, mean draft 4.1 |
+| Python code (500 tok) | 12.1 t/s | **7.9 t/s** | 47 %, mean 2.9 |
+| free German prose | 12.0 t/s | **5.5 t/s** | 25 %, mean 2.0 |
+
+Note the first row: 78 % acceptance and *still* half the speed. Qwen's
+MTP head is a full transformer layer (~0.5 GB in the file), and on this
+SYCL path its forward pass plus the batched verification of a 5-token
+draft costs more than five single-token steps. Gemma 4's win in the table
+above came from a 241 MB head verified at a much better ratio. Verdict:
+**no MTP for Qwen3.5 dense on this stack**; the numbers would only get
+worse at long context, so that was not measured. (Also a reminder that
+two 64k-context 9B instances do not fit next to each other on a 32 GB
+device — running the A/B side by side pushed the box 15 GiB into swap.)
+
+**UGREEN's own clients on the upstream runtime.** With the Qwen3.5-9B
+card enabled in the Model Manager, Uliya answered through the dispatcher
+→ b10621 path without any special handling (August 2026). Note that the
+CLI cannot enable a card it did not create: a model whose catalog row
+predates `ugos-llm` (or was made by UGOS itself) carries a vendor
+`release_id`, and `ui add`/`ui remove` refuse to touch it by design — use
+the UI toggle for those.
+
 ---
 
 ## 7. Vulkan (Mesa ANV) on the Meteor Lake iGPU: tested, rejected

@@ -92,7 +92,9 @@ generation **degrades to ~4.7 t/s once ~44k of context is resident**,
 because attention over the long history dominates. Loading takes ~26 s.
 On **b10621** (August 2026) the same model and config generates
 **~13.3 t/s** at small context — the runtime update alone is worth
-~18 % on this architecture.
+~18 % on this architecture. Do **not** reach for the `-MTP-GGUF` variant
+of this model on SYCL: its embedded draft head halves generation speed
+even at 78 % draft acceptance (measured, [known-bugs.md §6](known-bugs.md)).
 
 Qwen3.5-35B-A3B UD-IQ3_S (15.3 GB) on b10621, for calibration: a flat
 5.9 t/s generation on every workload (no MTP; prose and JSON identical —
