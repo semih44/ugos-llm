@@ -355,7 +355,63 @@ this verdict to age.
 
 ---
 
-## 8. Assorted smaller surprises
+## 8. OpenVINO Model Server on the same iGPU: measured, not adopted
+
+The other way around the SYCL kernel problem is Intel's own stack. OpenVINO
+2026.3 lists Qwen3.5/3.6 linear attention among its optimized paths and
+ships official INT4 IRs for both Qwen3.5-9B and 35B-A3B, and the Model
+Server (OVMS) speaks OpenAI chat completions — so it slots in next to the
+gateway without touching UGOS. Measured August 2026, same iDX6011, same
+prompts as the llama.cpp numbers above.
+
+**Setup that works.** `openvino/model_server:latest-gpu` with
+`--device /dev/dri --network host`, the server pulling
+`OpenVINO/Qwen3.5-9B-int4-ov` itself (`--source_model … --task
+text_generation --target_device GPU --rest_port …`). Three things to
+know: the image's default user cannot write a UGOS volume (ACLs —
+`Permission denied` on the model dir; run with `--user 0:0`); the
+generated `graph.pbtxt` defaults to `max_num_seqs: 256` (tune it down,
+along with `cache_size`, on a shared-memory box); and OVMS answers on
+`/v1/chat/completions` as well as `/v3/…`, so the bridge can point at it
+via `UPSTREAM` unchanged. `chat_template_kwargs` is honored, prefix
+caching is on by default, vision works via `image_url`. The 9B needs
+~7.4 GiB resident and noticeably more during load — a 14 GB cgroup cap
+killed it, 22 GB was fine.
+
+**Qwen3.5-9B, OVMS INT4 vs llama.cpp b10621 Q4_K_M:**
+
+| | OVMS (GPU) | llama.cpp (SYCL) |
+|---|---|---|
+| generation, free prose | ~15 t/s | 13.3 t/s |
+| cold 4k-token prefill (turn 1) | **15.5 s** | 25.6 s |
+| follow-up turns on the cached 4k prefix | 7.0 / 6.8 s | **3.4 / 3.2 s** |
+| vision round-trip (64×64 image) | 1.3 s | 3.7 s |
+| 4 German Paperless-style extractions | all valid JSON; one missing `due_date`, clunkier titles | all valid, schema-exact, cleaner titles |
+
+So: a real win on cold prefill (~+60 %) and vision latency, a real loss on
+multi-turn reuse (llama.cpp's prompt cache halves the follow-up cost, OVMS'
+prefix caching only takes ~55 % off), a slight but consistent quality edge
+for the Q4_K_M side, and OVMS is a second always-on service the UGOS UI
+cannot use. For a box whose interactive lane is multi-turn (VS Code) and
+whose batch lane cares about schema fidelity (Paperless), that nets out to
+**staying on llama.cpp** — re-measure when OpenVINO's hybrid-model prefix
+caching improves.
+
+**Qwen3.5-35B-A3B: does not fit, full stop.** The only official IR is
+23.1 GB (INT4 gs128, INT8 attention). Under a 25 GB no-swap cgroup with
+Paperless and the bridges stopped it was **OOM-killed after 21 s**, still
+in "Initializing … servable" — on an iGPU the weights are pinned host
+memory, and 23 GB plus a few for UGOS leaves nothing on 30.9 GiB. The
+first attempt, run without a cap next to Paperless, left the host with
+349 MiB and unresponsive; the lesson generalizes: **always run model
+experiments in a container with `--memory=X --memory-swap=X`** so the
+experiment dies instead of the NAS. The MoE-to-disk offloading mentioned
+in the 2026.3 release notes is not exposed as an OVMS option as far as we
+could find.
+
+---
+
+## 9. Assorted smaller surprises
 
 - The gateway request log (`infer_gateway_serv.log`) records **only failed**
   requests — but those with full request payloads. Great for debugging,

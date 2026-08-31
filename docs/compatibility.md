@@ -40,6 +40,9 @@ A Vulkan runtime variant for the same commit exists
 ([scripts/build-runtime-vulkan.sh](../scripts/build-runtime-vulkan.sh)) and
 was **tested and rejected** on the Meteor Lake iGPU: MoE hangs, dense runs
 ~45 % slower than SYCL — details in [known-bugs.md §7](known-bugs.md).
+OpenVINO Model Server was measured on the same box as well (faster cold
+prefill and vision, slower multi-turn reuse, 35B IR does not fit) — see
+[known-bugs.md §8](known-bugs.md).
 
 One deliberate conservatism in these verdicts: `TESTED` is granted only for
 the exact runtime build we verified — deploy a different one and `check`
