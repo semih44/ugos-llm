@@ -10,8 +10,10 @@ download) and applies the rules below.
 Since July 2026 the verdict depends on **which runtime the model will run
 on**: UGREEN's b8413, or a newer upstream build deployed alongside it via
 `ugos-llm runtime` (see [known-bugs.md §6](known-bugs.md)). Pass
-`--runtime upstream-b10143` to `check`/`install` to be judged against the
-latter.
+`--runtime upstream-b10143` (or whatever name you deployed, e.g.
+`upstream-b10621`) to `check`/`install` to be judged against the latter.
+Two upstream builds have been verified on-device so far: **b10143**
+(July 2026) and **b10621** (August 2026); per-row notes say which.
 
 ## Matrix — vendor runtime (b8413)
 
@@ -24,15 +26,20 @@ latter.
 | **any MoE** (`qwen35moe`, `qwen3moe`, `qwen2moe`, `glm4moe`, …) | ❌ **BROKEN** | SYCL build emits token soup — verified with two quant families |
 | `gemma4`, `qwen3_6` and anything newer than ~04/2026 | ❌ missing | not in b8413 |
 
-## Matrix — upstream runtime (b10143, self-built)
+## Matrix — upstream runtimes (self-built: b10143 Jul 2026, b10621 Aug 2026)
 
 | Architecture | Verdict | Notes |
 |---|---|---|
-| `gemma4` (incl. 26B-A4B MoE) | ✅ **TESTED** | end-to-end through the gateway: chat, long prompts at `-ub 4096`, **native tool calls**, vision, MTP draft head |
-| `qwen3_5` dense | ✅ **TESTED** | Qwen3.5-9B re-verified end-to-end on this build (Jul 2026): chat, long-prompt, native tool calls, vision — running at `-c 65536 -ub 512` |
-| `qwen35moe` and MoE generally | ✅ correct | no more token soup — but generation is SYCL-kernel-bound (~7 t/s for a 35B-A3B); only worth it with an MTP head |
-| every other architecture the vendor build loads (`qwen3`, `qwen2`, `llama`, `gemma`–`gemma3n`, `mistral`, `phi3`) | ✅ expected | a newer llama.cpp is an architectural superset of b8413, so these are present — just not re-verified on this build |
+| `gemma4` (incl. 26B-A4B MoE) | ✅ **TESTED** (b10143) | end-to-end through the gateway: chat, long prompts at `-ub 4096`, **native tool calls**, vision, MTP draft head |
+| `qwen3_5` dense | ✅ **TESTED** (b10143 + b10621) | Qwen3.5-9B verified end-to-end on both builds at `-c 65536 -ub 512`: chat, long-prompt, native tool calls, vision. b10621 generates ~13.3 t/s vs ~11.3 on b10143 — the update is ~18 % free speed on this arch |
+| `qwen35moe` (and MoE generally) | ✅ **TESTED** (b10621) — but slow | Qwen3.5-35B-A3B UD-IQ3_S verified end-to-end natively (Aug 2026): all acceptance tests incl. vision pass, prompt caching works. Generation is a flat 5.9 t/s (kernel-bound, prose = JSON), prefill ~62 t/s — see [known-bugs.md §6](known-bugs.md); we measured it and removed it |
+| every other architecture the vendor build loads (`qwen3`, `qwen2`, `llama`, `gemma`–`gemma3n`, `mistral`, `phi3`) | ✅ expected | a newer llama.cpp is an architectural superset of b8413, so these are present — just not re-verified on these builds |
 | anything else | ⚠️ unknown | `check --runtime` reports UNKNOWN — install and run `test` |
+
+A Vulkan runtime variant for the same commit exists
+([scripts/build-runtime-vulkan.sh](../scripts/build-runtime-vulkan.sh)) and
+was **tested and rejected** on the Meteor Lake iGPU: MoE hangs, dense runs
+~45 % slower than SYCL — details in [known-bugs.md §7](known-bugs.md).
 
 One deliberate conservatism in these verdicts: `TESTED` is granted only for
 the exact runtime build we verified — deploy a different one and `check`
@@ -45,8 +52,11 @@ this hardware and reports it (as happened for Qwen3.5-9B in July 2026).
 
 - **Q4_K_M** is the sweet spot and the only quant family battle-tested here.
   Q5_K_M / Q6_K should be equally safe (same kernel family), cost more RAM.
-- **IQ-quants (IQ4_XS, …): unverified.** Our only IQ test was on a (broken
-  anyway) MoE model, so no honest conclusion exists. If you test a dense
+- **IQ-quants: one honest data point now exists.** UD-IQ3_S (unsloth
+  imatrix) computed correctly on the upstream **b10621** SYCL runtime with
+  Qwen3.5-35B-A3B — full acceptance suite incl. the long-prompt corruption
+  detector (Aug 2026). Still unverified on the vendor b8413, and how much
+  *quality* a 3-bit quant costs vs Q4 was not measured. If you test a dense
   IQ-quant, please report the result.
 - Full precision (F16/BF16) barely fits and gains little; skip.
 
@@ -77,6 +87,14 @@ long-context realities: filling 44k takes ~4 minutes on the first shot
 (follow-ups reuse the prompt cache and only pay for the delta), and
 generation **degrades to ~4.7 t/s once ~44k of context is resident**,
 because attention over the long history dominates. Loading takes ~26 s.
+On **b10621** (August 2026) the same model and config generates
+**~13.3 t/s** at small context — the runtime update alone is worth
+~18 % on this architecture.
+
+Qwen3.5-35B-A3B UD-IQ3_S (15.3 GB) on b10621, for calibration: a flat
+5.9 t/s generation on every workload (no MTP; prose and JSON identical —
+the SYCL MoE path is kernel-bound, not bandwidth-bound) and ~62 t/s
+prefill over a 4k prompt. Fully correct, painfully deliberate.
 
 One sizing trap on 32 GB devices: UGOS' own task scheduler refuses to start
 an Uliya job unless *available* RAM exceeds the model's **file size** (a

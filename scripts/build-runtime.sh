@@ -18,8 +18,17 @@
 #     no GPU driver is bundled here.
 set -euo pipefail
 
-COMMIT=88b47a755c72fed4b22fba0fd262e2d7b7d01583   # = b10143, same as the
-BUILD=b10143                                      # verified container image
+# Two pins are verified end-to-end on an iDX6011; the default builds the
+# newer one (b10621, 2026-08-25 — ~18 % faster generation on the qwen3_5
+# arch, MTP autodetect/memory-fit, GDN writeback fusion). For a bit-exact
+# repro of the July verification (the build Gemma 4's acceptance run and
+# MTP numbers were measured on):
+#   docker run --rm -e UGOS_LLM_COMMIT=88b47a755c72fed4b22fba0fd262e2d7b7d01583 \
+#     -e UGOS_LLM_BUILD=b10143 -v /volume1/docker/ugos-llm-build:/out ...
+# If you pick your own pin: avoid b10552-b10575 (broken Q2_K ESIMD window,
+# re-landed in b10576) — see docs/known-bugs.md section 6.
+COMMIT=${UGOS_LLM_COMMIT:-c1d0e7a004015f23bc0233470b747b596f29b264}   # = b10621, verified Aug 2026
+BUILD=${UGOS_LLM_BUILD:-b10621}
 OUT=/out/ugos-llm-runtime-$BUILD
 
 echo "=== [1/6] deps ==="

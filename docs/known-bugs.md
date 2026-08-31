@@ -270,9 +270,92 @@ Verified: `reasoning_content` drops to 0 characters, answers start
 immediately, and the whole output budget goes to the actual answer — which
 also shortens the queue when several clients share the `-np 1` slot.
 
+**Runtime refresh: b10621 (August 2026, verified on-device).** The same
+recipe with `COMMIT`/`BUILD` bumped to the `b10621` release tag
+(`c1d0e7a0…`, 2026-08-25) builds and runs natively under the gateway,
+side-by-side with b10143 — models migrate per marker file, an unloaded
+model migrates without even a reload. What the window b10143→b10621 adds
+for this stack: the gated-delta-net writeback fusion, MTP autodetect and
+the MTP memory-fit fix, and ESIMD Q2_K/Q3_K/Q5_K kernels. Two upstream
+cautions if you pick your own pin: **avoid b10552–b10575** (broken Q2_K
+ESIMD land, reverted and re-landed in b10576), and recent builds moved
+SYCL host memory to pinned allocations — if you see load-time OOM or a
+CPU spin that older builds didn't have, try
+`GGML_SYCL_ENABLE_HOST_PINNED_MEM=0` in the wrapper.
+
+Measured on b10621, Qwen3.5-35B-A3B UD-IQ3_S (15.3 GB + mmproj, native
+through the gateway, `-c 65536 -ub 512 -fa off`, no MTP): **all four
+acceptance tests pass including vision**, and server-side prompt caching
+visibly works (the identical long-prompt check drops from 67.4 s to 3.8 s
+on repeat). But generation is a flat **5.9 t/s** — identical for free
+prose and JSON-only extraction, i.e. purely kernel-bound — and prompt
+processing ~62 t/s over a 4k prompt. The upstream issue for the Qwen3.5
+architecture malus on Intel iGPUs (llama.cpp #22001, ~40 % tg deficit)
+was closed *not planned* in June 2026, so do not wait for a fix. We did
+not A/B the embedded MTP head: on SYCL, MoE MTP measured *negative* on an
+Arc dGPU (discussion #26184) and IQ3-class quants regress hard with MTP
+(#27373). Verdict: the 35B MoE is correct and fully functional on this
+box, and roughly half the speed of the dense 9B at everything
+interactive. We installed it, measured it, and removed it again.
+
 ---
 
-## 7. Assorted smaller surprises
+## 7. Vulkan (Mesa ANV) on the Meteor Lake iGPU: tested, rejected
+
+The SYCL MoE malus (#22001 above) made the Vulkan backend the obvious
+thing to try — it is often faster than SYCL on Arc, and its
+gated-delta-net path is under active optimization. Short version: the
+runtime-bundling technique carries a whole foreign GPU driver just fine,
+and it is still not worth it on this silicon.
+
+**What works.** `scripts/build-runtime-vulkan.sh` builds llama.cpp with
+`GGML_VULKAN=ON` (same commit as the SYCL pin, ubuntu:22.04 base) and
+bundles mesa's ANV driver from the kisak PPA (stock jammy mesa predates
+Meteor Lake) plus the Vulkan loader. ANV needs **no vendor OpenCL and no
+level-zero** — it talks straight to the kernel DRM, and UGOS' 6.12 kernel
+is new enough. The ICD manifest is rewritten to a bare
+`"library_path": "libvulkan_intel.so"` so the loader resolves it via
+`LD_LIBRARY_PATH`; the runtime wrapper exports `VK_ICD_FILENAMES`,
+`VK_DRIVER_FILES` and a stable `MESA_SHADER_CACHE_DIR`. Device
+enumeration confirms `Vulkan0: Intel(R) Arc(tm) Graphics (MTL)`.
+
+Three traps found on the way, all now baked into the script/wrapper:
+
+1. **The ldd-closure gate is blind to libraries the build container has
+   system-wide.** `libvulkan_intel.so` pulls libbsd → libmd; the closure
+   copied libbsd on the last pass and never rescanned it, and the final
+   `ldd` check resolved libmd from the *container's* system dir — green
+   build, dead driver on the host (`libmd.so.0: cannot open shared object
+   file`, ICD silently skipped, "no devices"). Debug with
+   `VK_LOADER_DEBUG=error,warn,driver`. libmd is now bundled explicitly.
+2. **First start compiles shaders for ~3.5 minutes — the gateway kills it
+   at 2.** Same watchdog as the FA story in §6, same cure: run the server
+   once *outside* the gateway with the same `MESA_SHADER_CACHE_DIR`, then
+   the gateway start hits the warm cache. (The cache dir must be a stable
+   host path for that to work — not the container's own `/tmp`.)
+3. `--no-mmap` + full offload is a bad idea on Vulkan/iGPU — host staging
+   plus device-local heap both live in the same 32 GB. Drop it and let
+   mmap stream.
+
+**Why it was rejected anyway.** With all of that solved: `qwen35moe`
+(Qwen3.5-35B-A3B) **hangs forever on its first inference** — 100 % of one
+core (the backend busy-waits on a fence), shader cache no longer growing,
+a 4-token prompt with `max_tokens: 30` still nothing after 4 minutes.
+Reproduced with cooperative-matrix paths disabled
+(`GGML_VK_DISABLE_COOPMAT=1`, `GGML_VK_DISABLE_COOPMAT2=1`) and at
+`-c 8192` — so an ANV/Xe-LPG shader bug in the MoE path, not a memory or
+config issue. The dense 9B *does* run — at **6.7 t/s** generation (warm,
+repeated) versus ~11–12 t/s for the same model on the SYCL runtime:
+Vulkan/ANV is ~45 % slower on this iGPU even where it works.
+
+Verdict: **SYCL on UGREEN's OpenCL userspace stays the stack.** The build
+script is kept because it reproduces the experiment in one container run —
+re-run it when mesa or llama.cpp's Vulkan MoE path makes news, and expect
+this verdict to age.
+
+---
+
+## 8. Assorted smaller surprises
 
 - The gateway request log (`infer_gateway_serv.log`) records **only failed**
   requests — but those with full request payloads. Great for debugging,
