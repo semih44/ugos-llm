@@ -77,16 +77,27 @@ class TestExtraArgs(unittest.TestCase):
         self.assertNotIn("--jinja", ea)
         self.assertEqual(ea[ea.index("-c") + 1], "16384")
 
-    def test_upstream_args_use_4096_and_no_mmap_flag(self):
+    def test_upstream_args_default_to_ub_512_and_no_mmap_flag(self):
         ea = ug.build_extra_args(8192, runtime="upstream-b10143")
-        self.assertIn("4096", ea)
-        self.assertNotIn("512", ea)
+        # 512 everywhere: larger microbatches overflow the iGPU's 4 GiB
+        # allocation at big contexts and slowed MoE generation by ~20 %
+        self.assertEqual(ea[ea.index("-ub") + 1], "512")
+        self.assertEqual(ea[ea.index("-b") + 1], "512")
         # neither spelling: --no-mmap doubles host RAM and newer upstream
         # servers reject the flag outright
         self.assertNotIn("--no-mmap", ea)
         self.assertNotIn("--no_mmap", ea)
         self.assertIn("--jinja", ea)
         self.assertEqual(ea[ea.index("-c") + 1], "8192")
+
+    def test_ubatch_overrides_both_batch_sizes_upstream(self):
+        ea = ug.build_extra_args(8192, runtime="upstream-b10143", ubatch=4096)
+        self.assertEqual(ea[ea.index("-ub") + 1], "4096")
+        self.assertEqual(ea[ea.index("-b") + 1], "4096")
+
+    def test_large_ubatch_refused_on_vendor_runtime(self):
+        with self.assertRaises(SystemExit):
+            ug.build_extra_args(8192, ubatch=1024)
 
     def test_draft_args_reference_installed_draft_absolutely(self):
         ea = ug.build_extra_args(8192, runtime="upstream-b10143",
@@ -594,6 +605,15 @@ class TestRuntimeAwareLint(unittest.TestCase):
         warns = self._lint(["-ub", "4096", "-b", "4096"],
                            runtime="upstream-b10143")
         self.assertFalse(any("4096" in w for w in warns))
+
+    def test_upstream_oversized_ub_ctx_product_is_flagged(self):
+        warns = self._lint(["-ub", "4096", "-c", "16384"],
+                           runtime="upstream-b10143")
+        self.assertTrue(any("2^25" in w for w in warns))
+
+    def test_upstream_512_at_64k_is_fine(self):
+        self.assertEqual(self._lint(["-ub", "512", "-c", "65536"],
+                                    runtime="upstream-b10143"), [])
 
     def test_upstream_no_mmap_is_flagged_in_both_spellings(self):
         for flag in ("--no-mmap", "--no_mmap"):

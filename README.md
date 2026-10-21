@@ -28,8 +28,8 @@ and you can stop after the first:
 
 > **Tested on:** UGREEN NASync **iDX6011** (Core Ultra 5 125H, 32 GB SKU),
 > UGOS Pro, Model Manager `1.17.0.0055`, infer_gateway `1.0.0.0004`,
-> llama.cpp build `b8413` (SYCL, vendor) and self-built `b10143` and
-> `b10621` (SYCL, upstream — see the Gemma 4 section).
+> llama.cpp build `b8413` (SYCL, vendor) and self-built `b10143`, `b10621`
+> and `b11790` (SYCL, upstream — see the Gemma 4 section).
 > **Expected to work identically** on the iDX6011 64 GB SKU and the
 > **NASync iDX6011 Pro** (Core Ultra 7 255H, 64 GB) — same UGOS AI stack,
 > more RAM headroom for larger models. Reports welcome.
@@ -144,14 +144,16 @@ curl -Lo /volume1/docker/ugos-llm-build/build-runtime.sh \
 docker run --rm -v /volume1/docker/ugos-llm-build:/out \
   intel/oneapi-basekit:2025.3.2-0-devel-ubuntu22.04 bash /out/build-runtime.sh
 
-# result: /volume1/docker/ugos-llm-build/ugos-llm-runtime-b10621/
+# result: /volume1/docker/ugos-llm-build/ugos-llm-runtime-b11790/
 ```
 
-The default pin is the newest verified build (b10621, worth ~18 %
-generation speed on Qwen3.5 over the July pin); the script header
-documents the `UGOS_LLM_COMMIT`/`UGOS_LLM_BUILD` env override for a
-bit-exact repro of the earlier b10143 verification, and which pin range
-to avoid if you choose your own. Deployed runtimes live side-by-side and
+The default pin is the newest verified build (b11790, October 2026). It
+makes Qwen3.5-9B generate ~6 % faster than b10621, which was itself
+~18 % faster than the July pin, and MoE models no longer stall on IQ
+quants. The script header documents the `UGOS_LLM_COMMIT`/`UGOS_LLM_BUILD`
+env override for a bit-exact repro of the earlier b10621/b10143
+verifications, and which pin range to avoid if you choose your own. It
+fetches only the pinned commit, so a build takes minutes, not an hour. Deployed runtimes live side-by-side and
 models pick theirs per marker, so a new build never risks the one that
 works.
 
@@ -167,17 +169,17 @@ processing from 115 t/s down to under 2.
 # 254-byte llama-server wrapper for the dispatcher (the original is
 # preserved and stays the default path for every other model)
 python3 ugos-llm.py runtime deploy \
-    /volume1/docker/ugos-llm-build/ugos-llm-runtime-b10621 --name upstream-b10621
+    /volume1/docker/ugos-llm-build/ugos-llm-runtime-b11790 --name upstream-b11790
 python3 ugos-llm.py runtime enable
 
 # install Gemma 4 on that runtime, with vision and its MTP draft head;
 # --thinking off reproduces the benchmarked configuration. (Gemma 4's
 # acceptance run and the MTP numbers above were measured on the b10143
-# pin; on b10621 the architecture is expected-good — keep --test on and
+# pin; on newer pins the architecture is expected-good — keep --test on and
 # believe your own suite.)
 python3 ugos-llm.py install unsloth/gemma-4-26B-A4B-it-qat-GGUF \
     --quant UD-Q4_K_XL --vision --draft --thinking off \
-    --runtime upstream-b10621 --ui --test
+    --runtime upstream-b11790 --ui --test
 
 python3 ugos-llm.py runtime status   # dispatcher + marker overview
 python3 ugos-llm.py runtime disable  # restore the vendor wrapper
@@ -262,9 +264,15 @@ own RL-tuned 4B masks the issue; virtually any vanilla model exposes it.
 
 **On the vendor runtime, `ugos-llm.py` always configures `-ub 512 -b 512`**,
 which fixes correctness *and* roughly doubles prompt-processing speed there
-(182 vs 91 t/s measured). Models pinned to an upstream runtime deliberately
-keep `-ub 4096` — that build computes correctly at the larger microbatch and
-is faster for it.
+(182 vs 91 t/s measured). Upstream runtimes compute correctly at `-ub 4096`
+too, but get `-ub 512` by default as well (since October 2026), for two
+reasons:
+- At larger contexts the compute buffer overflows the iGPU's 4 GiB
+  single-allocation limit: `ub × ctx` must stay ≤ 2^25.
+- On a 35B-A3B MoE, any microbatch above 512 cost ~20 % generation speed.
+
+`install --ubatch 4096` restores faster prefill for small contexts
+(`--ctx 8192`).
 Full analysis: [docs/known-bugs.md](docs/known-bugs.md).
 
 ## Compatibility (short version)
@@ -273,18 +281,18 @@ Two runtimes, two answers. **Vendor** is the llama.cpp b8413 your NAS ships
 with; **upstream** is the newer build from the Gemma 4 section, which
 individual models opt into.
 
-| Model class | Vendor runtime (b8413) | Upstream runtime (b10143/b10621) |
+| Model class | Vendor runtime (b8413) | Upstream runtime (b10143/b10621/b11790) |
 |---|---|---|
-| Dense Qwen3.5 | ✅ tested (9B incl. vision + tools) | ✅ **tested** — 64k ctx, native tools, vision; ~13.3 t/s on b10621 |
+| Dense Qwen3.5 | ✅ tested (9B incl. vision + tools) | ✅ **tested** — 64k ctx, native tools, vision; 13.3 t/s on b10621, 14.05 t/s on b11790 |
 | Dense Qwen3 / Qwen2.5 / Llama 3.x / Gemma 2-3 / Mistral | ✅ expected, untested | ✅ expected, untested |
 | **Gemma 4** (incl. 26B-A4B) | ❌ architecture not in b8413 | ✅ **tested** (b10143) — vision, tools, MTP |
-| **MoE** (Qwen3.5-35B-A3B, …) | ❌ token soup, every quant tried | ✅ correct incl. vision — but 5.9 t/s measured (b10621) |
+| **MoE** (Qwen3.5-35B-A3B, …) | ❌ token soup, every quant tried | ✅ correct incl. vision — 14.7 t/s alone on b11790 (5.9 on b10621, an IQ-quant bug), 10–12 t/s via the gateway on 32 GB |
 | K-quants (Q4_K_M, Q5_K_M, …) | ✅ | ✅ |
-| IQ-quants | ⚠️ unverified | ✅ UD-IQ3_S verified correct (b10621) |
+| IQ-quants | ⚠️ unverified | ✅ UD-IQ3_S verified correct (b10621); fast in MoE from b10868 |
 
 These are the verdicts `check` actually prints. Gemma 4 earned its
 upstream "tested" on b10143; Qwen3.5 dense and the 35B MoE earned theirs
-end-to-end on b10621. A **Vulkan** runtime variant was also built and
+end-to-end on b10621 and again on b11790. A **Vulkan** runtime variant was also built and
 tested on this iGPU — and rejected (MoE hangs, dense 45 % slower than
 SYCL): [docs/known-bugs.md §7](docs/known-bugs.md).
 
@@ -326,7 +334,7 @@ detected and **rejected** rather than half-installed. Pick a single-file quant.
 ## Development
 
 ```bash
-python3 -m unittest discover -s tests -v    # 145 unit tests, stdlib only
+python3 -m unittest discover -s tests -v    # 154 unit tests, stdlib only
 ```
 
 The suite needs neither root nor Docker — every privileged call is faked —

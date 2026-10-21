@@ -32,7 +32,7 @@ Two upstream builds have been verified on-device so far: **b10143**
 |---|---|---|
 | `gemma4` (incl. 26B-A4B MoE) | ✅ **TESTED** (b10143) | end-to-end through the gateway: chat, long prompts at `-ub 4096`, **native tool calls**, vision, MTP draft head |
 | `qwen3_5` dense | ✅ **TESTED** (b10143 + b10621) | Qwen3.5-9B verified end-to-end on both builds at `-c 65536 -ub 512`: chat, long-prompt, native tool calls, vision. b10621 generates ~13.3 t/s vs ~11.3 on b10143 — the update is ~18 % free speed on this arch |
-| `qwen35moe` (and MoE generally) | ✅ **TESTED** (b10621) — but slow | Qwen3.5-35B-A3B UD-IQ3_S verified end-to-end natively (Aug 2026): all acceptance tests incl. vision pass, prompt caching works. Generation is a flat 5.9 t/s (kernel-bound, prose = JSON), prefill ~62 t/s — see [known-bugs.md §6](known-bugs.md); we measured it and removed it |
+| `qwen35moe` (and MoE generally) | ✅ **TESTED** (b10621, b11790) — fast alone, memory-bound on 32 GB | Qwen3.5-35B-A3B UD-IQ3_S passes all acceptance tests incl. vision. On b10621 generation was a flat 5.9 t/s (IQ experts host-serialized, fixed in b10868). On b11790 it makes 14.7 t/s alone but 10–12 t/s through the gateway once the iGPU holds >15 GB; prefill ~60 t/s at `-ub 512` — see [known-bugs.md §6](known-bugs.md) |
 | every other architecture the vendor build loads (`qwen3`, `qwen2`, `llama`, `gemma`–`gemma3n`, `mistral`, `phi3`) | ✅ expected | a newer llama.cpp is an architectural superset of b8413, so these are present — just not re-verified on these builds |
 | anything else | ⚠️ unknown | `check --runtime` reports UNKNOWN — install and run `test` |
 
@@ -96,10 +96,16 @@ On **b10621** (August 2026) the same model and config generates
 of this model on SYCL: its embedded draft head halves generation speed
 even at 78 % draft acceptance (measured, [known-bugs.md §6](known-bugs.md)).
 
-Qwen3.5-35B-A3B UD-IQ3_S (15.3 GB) on b10621, for calibration: a flat
-5.9 t/s generation on every workload (no MTP; prose and JSON identical —
-the SYCL MoE path is kernel-bound, not bandwidth-bound) and ~62 t/s
-prefill over a 4k prompt. Fully correct, painfully deliberate.
+Qwen3.5-35B-A3B UD-IQ3_S (13.6 GB) for calibration:
+- **b10621:** a flat 5.9 t/s generation. That was a bug: IQ experts went
+  through a host-serialized fallback, fixed in b10868 (llama.cpp #28476).
+- **b11790, alone, `-c 16384`, `-ub 512`:** 14.7 t/s generation and
+  ~60 t/s prefill.
+- **b11790, through the gateway on a 32 GB box:** 10–12 t/s, because the
+  iGPU then holds more than ~15 GB.
+
+Larger microbatches double prefill but cost ~20 % generation. The dense
+9B on b11790 runs at 14.05 t/s with 176 t/s prefill.
 
 One sizing trap on 32 GB devices: UGOS' own task scheduler refuses to start
 an Uliya job unless *available* RAM exceeds the model's **file size** (a

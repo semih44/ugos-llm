@@ -309,6 +309,36 @@ class TestCLIValidation(unittest.TestCase):
         with self.assertRaises(SystemExit):
             ug.cmd_install(args)
 
+    def test_ubatch_ctx_product_rejected_before_download(self):
+        args = ug.build_parser().parse_args(
+            ["install", "o/r", "--runtime", "upstream-b11790",
+             "--ubatch", "4096", "--ctx", "16384"])
+        with self.assertRaises(SystemExit):
+            ug.cmd_install(args)
+
+    def test_large_ubatch_needs_upstream_runtime(self):
+        args = ug.build_parser().parse_args(
+            ["install", "o/r", "--ubatch", "1024"])
+        with self.assertRaises(SystemExit):
+            ug.cmd_install(args)
+
+
+class TestPickMmproj(unittest.TestCase):
+    def test_prefers_plain_f16_over_bf16(self):
+        files = [("mmproj-BF16.gguf", 1), ("mmproj-F16.gguf", 2),
+                 ("mmproj-F32.gguf", 3), ("Model-Q4_K_M.gguf", 9)]
+        self.assertEqual(ug.pick_mmproj(files), ("mmproj-F16.gguf", 2))
+
+    def test_falls_back_to_bf16_then_anything(self):
+        self.assertEqual(ug.pick_mmproj([("mmproj-BF16.gguf", 1),
+                                         ("mmproj-F32.gguf", 3)]),
+                         ("mmproj-BF16.gguf", 1))
+        self.assertEqual(ug.pick_mmproj([("mmproj-F32.gguf", 3)]),
+                         ("mmproj-F32.gguf", 3))
+
+    def test_none_without_projector(self):
+        self.assertIsNone(ug.pick_mmproj([("Model-Q4_K_M.gguf", 9)]))
+
 
 class TestAtomicInstall(unittest.TestCase):
     """The install must never leave a half-populated model directory active."""

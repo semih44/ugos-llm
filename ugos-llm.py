@@ -75,9 +75,19 @@ SAFE_EXTRA_ARGS = ["-ngl", "999", "-t", "10", "-e", "-lv", "3",
 # the flag in Sept 2026 (llama.cpp #28334), so newer servers refuse to start
 # with it. The default load mode maps the file — clean, reclaimable page
 # cache. See docs/known-bugs.md section 10.
+# Microbatch 512 here too (Oct 2026): upstream computes correctly at 4096,
+# but ub x ctx above 2^25 overflows the iGPU's 4 GiB single-allocation
+# limit, and on a 35B-A3B MoE anything above 512 cost ~20 % generation
+# speed (14.7 -> 11.5 t/s). `install --ubatch` raises it for small contexts.
 UPSTREAM_EXTRA_ARGS = ["-ngl", "999", "-t", "10", "-e", "-lv", "3",
                        "--no-warmup", "-fa", "off", "-np", "1",
-                       "-ub", "4096", "-b", "4096", "--jinja"]
+                       "-ub", "512", "-b", "512", "--jinja"]
+
+# Largest ub x ctx product verified to load on the iGPU (512 x 65536 and
+# 4096 x 8192); 4096 x 16384 failed with "failed to allocate compute pp
+# buffers" (docs/known-bugs.md section 6).
+UB_CTX_PRODUCT_MAX = 2 ** 25
+UBATCH_CHOICES = (256, 512, 1024, 2048, 4096)
 
 # Where alternative runtimes live and how models opt in. The dispatcher
 # replaces UGREEN's 258-byte llama-server wrapper; the original is kept
@@ -106,7 +116,12 @@ UPSTREAM_ARCH_TESTED = {"qwen35moe", "gemma4", "gemma4moe",
                         # Qwen3.5-9B re-verified end-to-end on b10143
                         # (chat/long-prompt/tools/vision, 29 Jul 2026)
                         "qwen3_5", "qwen35"}
-UPSTREAM_TESTED_RUNTIMES = {"upstream-b10143"}
+UPSTREAM_TESTED_RUNTIMES = {"upstream-b10143",
+                            # Qwen3.5-9B + 35B-A3B acceptance, Aug 2026
+                            "upstream-b10621",
+                            # Qwen3.5-9B + 35B-A3B acceptance and a
+                            # 13.9k-token recall check, Oct 2026
+                            "upstream-b11790"}
 
 STATUS = {1: "not installed", 3: "disabled", 8: "active"}
 
@@ -569,17 +584,20 @@ def classify_arch(arch, runtime=None):
     a = (arch or "").lower().replace(".", "_").replace("-", "_")
     if runtime and str(runtime).startswith("upstream"):
         moe_note = ("" if not ARCH_BROKEN_MOE.search(a) else
-                    " MoE computes correctly on upstream runtimes, but "
-                    "generation is SYCL-kernel-bound and slow (~7 t/s for a "
-                    "35B-A3B) — pair it with an MTP draft head (--draft) "
-                    "where the repo ships one.")
+                    " MoE computes correctly on upstream runtimes. Use a "
+                    "build >= b10868 (before it, IQ quants stalled the SYCL "
+                    "MoE path at ~6 t/s). Generation still gets slow once "
+                    "the iGPU holds more than ~15 GB: a 35B-A3B made 14.7 "
+                    "t/s alone but 10-12 t/s through the gateway at 17.5 GB "
+                    "— keep --ctx small, -ub 512, and add --draft where the "
+                    "repo ships an MTP head.")
         if a in UPSTREAM_ARCH_TESTED:
             if str(runtime) in UPSTREAM_TESTED_RUNTIMES:
-                return "TESTED", ("verified on this hardware with the b10143 "
-                                  "build (docs/known-bugs.md section 6)."
+                return "TESTED", ("verified on this hardware with runtime "
+                                  f"{runtime} (docs/known-bugs.md section 6)."
                                   + moe_note)
-            return "EXPECTED", ("architecture works on the verified b10143 "
-                                f"build, but runtime {runtime} itself is "
+            return "EXPECTED", ("architecture works on the verified upstream "
+                                f"builds, but runtime {runtime} itself is "
                                 "unverified here — run `test` after "
                                 "installing." + moe_note)
         if a in ARCH_TESTED_OK or a in ARCH_EXPECTED_OK or moe_note:
@@ -636,7 +654,8 @@ def split_siblings(files, filename):
 # Runtime profiles — vendor b8413 vs. upstream llama.cpp builds
 # --------------------------------------------------------------------------
 
-def build_extra_args(ctx, runtime=None, draft_name=None, thinking=None):
+def build_extra_args(ctx, runtime=None, draft_name=None, thinking=None,
+                     ubatch=None):
     """The llama-server argv fragment for a model config, per runtime."""
     upstream = bool(runtime and str(runtime).startswith("upstream"))
     if draft_name and not upstream:
@@ -645,7 +664,13 @@ def build_extra_args(ctx, runtime=None, draft_name=None, thinking=None):
     if thinking in ("on", "off") and not upstream:
         die("--thinking needs --runtime upstream-*: the vendor build (b8413) "
             "has no --chat-template-kwargs.")
+    if ubatch and ubatch > 512 and not upstream:
+        die("--ubatch above 512 needs --runtime upstream-*: the vendor build "
+            "(b8413) computes garbage on long prompts at larger microbatches "
+            "(docs/known-bugs.md section 1).")
     ea = list(UPSTREAM_EXTRA_ARGS if upstream else SAFE_EXTRA_ARGS)
+    if ubatch:
+        ea[ea.index("-ub") + 1] = ea[ea.index("-b") + 1] = str(ubatch)
     ea += ["-c", str(ctx)]
     if draft_name:
         ea += ["--spec-draft-model",
@@ -772,6 +797,16 @@ def lint_model_config(name, cfg, runtime=None, model_dir=None):
     if not upstream and "4096" in ea:
         warns.append(f"{name} uses -ub/-b 4096 -> change to 512 "
                      "(docs/known-bugs.md) and reload")
+    if upstream and "-ub" in ea and "-c" in ea:
+        try:
+            product = int(ea[ea.index("-ub") + 1]) * int(ea[ea.index("-c") + 1])
+        except (ValueError, IndexError):
+            product = 0
+        if product > UB_CTX_PRODUCT_MAX:
+            warns.append(f"{name}: -ub x -c = {product} exceeds 2^25 — the "
+                         "compute buffer may not fit the iGPU's 4 GiB "
+                         "single-allocation limit; lower -ub (512 is safe up "
+                         "to -c 65536)")
     if upstream and ("--no-mmap" in ea or "--no_mmap" in ea):
         warns.append(f"{name}: drop '--no-mmap' — on the iGPU it keeps a "
                      "second, swappable host copy of the weights, and "
@@ -964,6 +999,18 @@ def _download(url, dest, label, expect_size=0):
     os.rename(tmp, dest)
 
 
+def pick_mmproj(files):
+    """The vision projector to install: plain F16 first (the tested format —
+    a bare "f16" match would also hit BF16, which sorts first in unsloth
+    repos), then BF16, then whatever else the repo ships."""
+    cand = [(n, s) for n, s in files if "mmproj" in n.lower()]
+    for pat in (r"(?<!b)f16", r"bf16"):
+        hit = [c for c in cand if re.search(pat, c[0].lower())]
+        if hit:
+            return hit[0]
+    return cand[0] if cand else None
+
+
 def _staged(stage, repo, filename, expect_size):
     """Staging cache keyed by repo AND filename; reuse only when the size
     matches and the file really is a GGUF (guards against collisions and
@@ -1008,6 +1055,14 @@ def cmd_install(args):
     if args.thinking != "auto" and not args.runtime:
         die("--thinking needs --runtime upstream-*: the vendor build (b8413) "
             "has no --chat-template-kwargs.")
+    if args.ubatch and args.ubatch > 512 and not args.runtime:
+        die("--ubatch above 512 needs --runtime upstream-*: the vendor build "
+            "(b8413) computes garbage on long prompts at larger microbatches "
+            "(docs/known-bugs.md section 1).")
+    if (args.ubatch or 512) * args.ctx > UB_CTX_PRODUCT_MAX:
+        die(f"--ubatch {args.ubatch} x --ctx {args.ctx} exceeds 2^25: the "
+            "compute buffer would not fit the iGPU's 4 GiB single-allocation "
+            "limit. Lower one of them (512 works up to --ctx 65536).")
     if args.runtime:
         state, _ = dispatcher_state()
         if args.runtime not in installed_runtimes() or state != "ours":
@@ -1035,11 +1090,10 @@ def cmd_install(args):
 
     mmproj_file = mmproj_size = None
     if args.vision:
-        cand = [(n, s) for n, s in files if "mmproj" in n.lower()]
-        pref = [c for c in cand if "f16" in c[0].lower()] or cand
-        if not pref:
+        picked = pick_mmproj(files)
+        if not picked:
             die("--vision requested but this repo ships no mmproj projector.")
-        mmproj_file, mmproj_size = pref[0]
+        mmproj_file, mmproj_size = picked
 
     draft_file = draft_size = None
     if args.draft:
@@ -1083,7 +1137,8 @@ def cmd_install(args):
            "extra_args": build_extra_args(
                args.ctx, runtime=args.runtime,
                draft_name=name if draft_file else None,
-               thinking=None if args.thinking == "auto" else args.thinking),
+               thinking=None if args.thinking == "auto" else args.thinking,
+               ubatch=args.ubatch),
            "capabilities": ["completion"] + (["vision"] if mmproj_file else [])}
     if mmproj_file:
         cfg["mmproj"] = "mmproj.gguf"
@@ -1684,6 +1739,11 @@ def build_parser():
                    help="server-side default for the model's thinking block "
                         "(via --chat-template-kwargs; requires --runtime "
                         "upstream-*). auto = template default")
+    p.add_argument("--ubatch", type=int, choices=UBATCH_CHOICES,
+                   help="microbatch (-ub/-b; default 512). Larger values "
+                        "speed up prompt processing but need --runtime "
+                        "upstream-*, keep ubatch x ctx <= 2^25 (4096 only "
+                        "up to --ctx 8192) and slowed MoE generation")
     p.add_argument("--test", action="store_true",
                    help="run the acceptance suite right after installing")
     p.add_argument("--force", action="store_true")

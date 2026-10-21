@@ -18,17 +18,22 @@
 #     no GPU driver is bundled here.
 set -euo pipefail
 
-# Two pins are verified end-to-end on an iDX6011; the default builds the
-# newer one (b10621, 2026-08-25 — ~18 % faster generation on the qwen3_5
-# arch, MTP autodetect/memory-fit, GDN writeback fusion). For a bit-exact
-# repro of the July verification (the build Gemma 4's acceptance run and
-# MTP numbers were measured on):
-#   docker run --rm -e UGOS_LLM_COMMIT=88b47a755c72fed4b22fba0fd262e2d7b7d01583 \
-#     -e UGOS_LLM_BUILD=b10143 -v /volume1/docker/ugos-llm-build:/out ...
+# Three pins are verified end-to-end on an iDX6011; the default builds the
+# newest (b11790, 2026-10-21: Qwen3.5-9B +6 % generation over b10621, and
+# the IQ-quant MoE fix from b10868 — a 35B-A3B went from 5.9 to 14.7 t/s).
+# GGML_SYCL_F16=ON is fine on Meteor Lake: the F16 NaN regression of
+# b11636+ (llama.cpp #30892) sits in the XMX fused-GEMM path, which this
+# iGPU lacks, and a 13.9k-token recall check passed. Older pins:
+#   b10621: UGOS_LLM_COMMIT=c1d0e7a004015f23bc0233470b747b596f29b264
+#   b10143: UGOS_LLM_COMMIT=88b47a755c72fed4b22fba0fd262e2d7b7d01583
+#           (the build Gemma 4's acceptance run and MTP numbers used)
+#   docker run --rm -e UGOS_LLM_COMMIT=<sha> -e UGOS_LLM_BUILD=<tag> \
+#     -v /volume1/docker/ugos-llm-build:/out ...
 # If you pick your own pin: avoid b10552-b10575 (broken Q2_K ESIMD window,
-# re-landed in b10576) — see docs/known-bugs.md section 6.
-COMMIT=${UGOS_LLM_COMMIT:-c1d0e7a004015f23bc0233470b747b596f29b264}   # = b10621, verified Aug 2026
-BUILD=${UGOS_LLM_BUILD:-b10621}
+# re-landed in b10576), and from ~b10875 on `--no-mmap` no longer exists —
+# see docs/known-bugs.md sections 6 and 10.
+COMMIT=${UGOS_LLM_COMMIT:-0efe8e4c6bb946fb71327b068b26c17d5d15121e}   # = b11790, verified Oct 2026
+BUILD=${UGOS_LLM_BUILD:-b11790}
 OUT=/out/ugos-llm-runtime-$BUILD
 
 echo "=== [1/6] deps ==="

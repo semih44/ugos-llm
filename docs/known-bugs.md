@@ -298,6 +298,40 @@ Arc dGPU (discussion #26184) and IQ3-class quants regress hard with MTP
 box, and roughly half the speed of the dense 9B at everything
 interactive. We installed it, measured it, and removed it again.
 
+**Update, October 2026 — the 5.9 t/s was a bug, and the next limit is
+memory.** llama.cpp #28476 (merged 2026-09-09, in b10868) added the IQ
+quant types to the SYCL MoE kernel. Before that, every IQ-quantized expert
+(our UD-IQ3_S) went through a host-serialized fallback. The same file on
+a b11790 runtime:
+
+| configuration (b11790, `-fa off`) | iGPU memory | generation | prompt (13.9k tokens) |
+|---|---|---|---|
+| container, `-c 16384`, no mmproj, `-ub 512` | (not measured) | **14.7 t/s** | 60 t/s |
+| same, `-ub 1024` | larger | 11.5 t/s | 90 t/s |
+| same, `-ub 2048` | larger | 11.5 t/s | 124 t/s |
+| gateway, `-c 32768`, mmproj on the iGPU | 19.0 GB | 8.7 t/s | 56 t/s |
+| gateway, `-c 16384`, `--no-mmproj-offload` | 17.5 GB | 10–12 t/s | 60 t/s |
+
+Every configuration passed the acceptance suite and recalled a fact
+planted in a 13.9k-token prompt exactly. Three findings:
+- **Speed falls with iGPU footprint.** Generation drops once the iGPU
+  holds more than ~15 GB. It is not ordinary swapping: `vmstat` showed no
+  swap-out and a few KB/s of swap-in during generation. The 13.6 GB of
+  35B weights leave too little room on a 32 GB box. The dense 9B
+  (14.9 GB at `-c 65536`) stays below that line.
+- **Microbatch: above 512 trades generation for prefill on MoE.**
+- **`-fa on` never became ready.** The first spawn compiles kernels for
+  longer than the gateway's 2-minute readiness window, and the gateway
+  killed the server (`signal: killed`). A pre-warmed kernel cache might
+  get around it; untested.
+
+Same day, same runtime, the dense Qwen3.5-9B Q4_K_M generates at
+**14.05 t/s** with 176 t/s prefill. That is +6 % and +3 % over b10621,
+from the post-August SYCL fusion work. **Verdict: the 35B-A3B is correct
+and no longer slow in isolation, but on a 32 GB iDX6011 it does not beat
+the 9B in daily use.** We kept the 9B. Re-test on a box with more RAM or
+with a smaller MoE.
+
 **Qwen3.5-9B with its embedded MTP head: slower, not faster (b10621,
 August 2026).** unsloth ships `Qwen3.5-9B-MTP-GGUF` — identical weights
 plus a multi-token-prediction head baked into the GGUF, enabled with
