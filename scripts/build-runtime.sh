@@ -44,9 +44,14 @@ else
 fi
 
 echo "=== [2/6] source ==="
-git clone --quiet https://github.com/ggml-org/llama.cpp /src
+# Only the pinned commit, not the whole history: a full clone is several
+# hundred MB and crawled at ~0.2 MB/s on the NAS (Oct 2026); GitHub serves
+# a single reachable commit by SHA.
+git init --quiet /src
 cd /src
-git checkout --quiet $COMMIT
+git remote add origin https://github.com/ggml-org/llama.cpp
+git fetch --quiet --depth 1 origin "$COMMIT"
+git checkout --quiet FETCH_HEAD
 
 echo "=== [3/6] configure + build ==="
 source /opt/intel/oneapi/setvars.sh > /dev/null 2>&1 || true
@@ -69,8 +74,8 @@ rm -rf "$OUT"          # stale libraries from a previous run must not survive
 mkdir -p "$OUT"
 cp -P build/bin/llama-server "$OUT/"
 find build -name "*.so*" -exec cp -P {} "$OUT/" \;
-CMPLR=$(ls -d /opt/intel/oneapi/compiler/2025.*/lib | head -1)
-MKL=$(ls -d /opt/intel/oneapi/mkl/2025.*/lib | head -1)
+CMPLR=$(ls -d /opt/intel/oneapi/compiler/20*/lib | head -1)
+MKL=$(ls -d /opt/intel/oneapi/mkl/20*/lib | head -1)
 UMF=$(ls -d /opt/intel/oneapi/umf/*/lib | head -1)
 cp -P "$CMPLR"/libur_adapter_level_zero.so* "$CMPLR"/libur_adapter_opencl.so* "$OUT/"
 cp -P "$UMF"/libumf.so* "$OUT/"
