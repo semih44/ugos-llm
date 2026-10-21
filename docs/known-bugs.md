@@ -465,3 +465,71 @@ could find.
   unless the SFTP service is enabled in UGOS (Control Panel → Terminal).
 - UGOS's root filesystem is immutable — even root cannot `mkdir /home/x`.
   User homes require enabling the "personal folder" in the Files app.
+
+---
+
+## 10. `--no-mmap` doubles the model's memory on the iGPU (and upstream dropped the flag)
+
+An iGPU has no VRAM of its own. The "device" buffers are i915 GEM objects
+in system RAM. They are shmem-backed, so they show up as `Shmem` in
+`/proc/meminfo` and per process as `drm-total-system0` in
+`/proc/<pid>/fdinfo/*`. Shmem can be swapped like any other anonymous
+memory. With `--no-mmap`, llama-server *additionally* reads the whole GGUF,
+mmproj included, into anonymous host memory and keeps it. That is a
+second copy that nothing touches after the upload to the iGPU.
+
+**Setup:** measured October 2026 on an iDX6011 after 25 days of uptime.
+The model was Qwen3.5-9B Q4_K_M (5.68 GB) plus mmproj F16 (0.92 GB) on
+b10621, run with `-c 65536 -ub 512 -fa off`:
+
+| | with `--no-mmap` | without it, fresh boot |
+|---|---|---|
+| iGPU buffers (`drm-total-system0`) | 13.6 GB | 14.6 GB (after a 14k-token prompt) |
+| llama-server anonymous memory | 8.8 GB, 4.7 GB of it swapped | 33 MB RSS, nothing swapped |
+| swap (4×4 GB zram + 6 GB on disk) | 21 of 21 GB used | 0, later 1.2 GB |
+| generation, 300-token prose | 10.7 t/s | 13.3 t/s |
+| first request after an idle period | +20 s (prompt phase at 1.8 t/s) | normal |
+
+**What happened:** UGOS ships four 4 GB zram devices at swappiness 60.
+1. Under memory pressure the kernel swapped out the idle host copy first.
+2. It then swapped the iGPU buffers themselves.
+3. Model weights barely compress (~1.29:1). zram therefore spent ~11.6 GB
+   of real RAM holding ~15 GB of swapped data, which fed the pressure.
+4. Every request after an idle period first had to fault the GPU buffers
+   back in, which is the 20-second prompt phase above.
+
+To be precise about the evidence: the right-hand column combines two
+changes, a reboot and dropping the flag. A reboot alone also empties the
+swap, but only for a while. The 8.8 GB of anonymous memory that does not
+come back is what keeps it empty. Long-prompt correctness was checked
+after the change: a fact planted in a 13.9k-token prompt was recalled
+exactly, with prompt processing at 170 t/s.
+
+**Fix: drop the flag.**
+- **Default behaviour:** the server maps the file instead. The host side
+  becomes clean page cache, which the kernel drops without swapping.
+- **Upstream removal:** upstream removed `--no-mmap`, `--mmap` and
+  `--mlock` in September 2026 (llama.cpp #28334, around b10875) in favour
+  of `--load-mode {auto,none,mmap,mlock,mmap+mlock,dio}`. A newer server
+  refuses to start when it sees `--no-mmap`.
+- **This tool:** `ugos-llm.py` no longer emits the flag for upstream
+  runtimes, and `doctor` flags it in either spelling. The vendor runtime
+  (b8413) keeps its `--no_mmap`, which is untested there.
+
+**Related: UGREEN's semantic search loads at boot.** The semantic-search
+service (`ugreen_rag_serv@aiconsole`, process `rag_ai_sdk_tool`) loads
+its ~2.1 GB embedding model onto the iGPU at every boot. It does so even
+when that model is switched off in the Model Manager UI. Stopping the unit
+frees the memory until the next boot. Do not mask it blindly: the same
+service also runs the Postgres database named `uliya`.
+
+**Diagnostics:**
+- `grep -E 'Shmem|Swap' /proc/meminfo`: iGPU buffers and swap at a glance.
+- `/proc/<pid>/fdinfo/*`: the `drm-total-system0` line gives iGPU memory
+  per process.
+- `/proc/<pid>/smaps_rollup`: resident anonymous memory versus swapped.
+- `/sys/block/zram*/mm_stat`: original size versus compressed size,
+  i.e. how well your swap really compresses.
+
+Reading other processes needs root. On UGOS:
+`docker run --rm --privileged --pid=host alpine:3.20 …`.

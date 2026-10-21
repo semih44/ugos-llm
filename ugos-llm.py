@@ -69,10 +69,14 @@ SAFE_EXTRA_ARGS = ["-ngl", "999", "-t", "10", "-e", "-lv", "3",
 
 # Upstream llama.cpp runtimes (installed via `runtime deploy`) fix both the
 # ub-4096 numerical bug and MoE support, so their default config differs.
-# Mind the spelling: UGREEN's patched b8413 accepts `--no_mmap`, the upstream
-# parser only `--no-mmap` — the wrong variant kills the server at spawn.
+# Deliberately no mmap flag: with `--no-mmap` the server keeps a full
+# anonymous host copy of the weights next to the iGPU buffers (8.8 GB for a
+# 9B + mmproj), which the kernel swaps out over time; and upstream removed
+# the flag in Sept 2026 (llama.cpp #28334), so newer servers refuse to start
+# with it. The default load mode maps the file — clean, reclaimable page
+# cache. See docs/known-bugs.md section 10.
 UPSTREAM_EXTRA_ARGS = ["-ngl", "999", "-t", "10", "-e", "-lv", "3",
-                       "--no-warmup", "--no-mmap", "-fa", "off", "-np", "1",
+                       "--no-warmup", "-fa", "off", "-np", "1",
                        "-ub", "4096", "-b", "4096", "--jinja"]
 
 # Where alternative runtimes live and how models opt in. The dispatcher
@@ -768,10 +772,11 @@ def lint_model_config(name, cfg, runtime=None, model_dir=None):
     if not upstream and "4096" in ea:
         warns.append(f"{name} uses -ub/-b 4096 -> change to 512 "
                      "(docs/known-bugs.md) and reload")
-    if upstream and "--no_mmap" in ea:
-        warns.append(f"{name}: '--no_mmap' is the vendor spelling — b10143 "
-                     "normalizes '_' to '-' so it still works, but prefer "
-                     "the canonical '--no-mmap'")
+    if upstream and ("--no-mmap" in ea or "--no_mmap" in ea):
+        warns.append(f"{name}: drop '--no-mmap' — on the iGPU it keeps a "
+                     "second, swappable host copy of the weights, and "
+                     "upstream builds from Sept 2026 on refuse to start with "
+                     "it (docs/known-bugs.md section 10)")
     if "--spec-draft-model" in ea:
         p = ea[ea.index("--spec-draft-model") + 1]
         if not os.path.isabs(p) and model_dir:

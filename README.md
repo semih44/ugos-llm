@@ -326,8 +326,13 @@ detected and **rejected** rather than half-installed. Pick a single-file quant.
 ## Development
 
 ```bash
-python3 -m unittest discover -s tests -v    # 108 unit tests, stdlib only
+python3 -m unittest discover -s tests -v    # 145 unit tests, stdlib only
 ```
+
+The suite needs neither root nor Docker — every privileged call is faked —
+but it does need a POSIX system (Linux or macOS): the CLI itself relies on
+`fcntl` locks and POSIX rename semantics, because it only ever runs on the
+NAS. Windows is not supported, not even for running the tests.
 
 CI runs the suite on Python 3.9 and 3.12 plus a ruff lint. The risky parts —
 name validation, GGUF header parsing, architecture rules, split detection,

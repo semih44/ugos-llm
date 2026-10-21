@@ -77,11 +77,13 @@ class TestExtraArgs(unittest.TestCase):
         self.assertNotIn("--jinja", ea)
         self.assertEqual(ea[ea.index("-c") + 1], "16384")
 
-    def test_upstream_args_use_4096_and_dash_mmap(self):
+    def test_upstream_args_use_4096_and_no_mmap_flag(self):
         ea = ug.build_extra_args(8192, runtime="upstream-b10143")
         self.assertIn("4096", ea)
         self.assertNotIn("512", ea)
-        self.assertIn("--no-mmap", ea)      # upstream parser rejects --no_mmap
+        # neither spelling: --no-mmap doubles host RAM and newer upstream
+        # servers reject the flag outright
+        self.assertNotIn("--no-mmap", ea)
         self.assertNotIn("--no_mmap", ea)
         self.assertIn("--jinja", ea)
         self.assertEqual(ea[ea.index("-c") + 1], "8192")
@@ -407,8 +409,12 @@ class TestRuntimeDeployDockerPath(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
         self._runtimes, self._root = ug.RUNTIMES_DIR, ug.is_root
         self._staging, self._docker = ug._staging_dir, ug._docker
+        self._have_docker = ug.have_docker
         ug.RUNTIMES_DIR = os.path.join(self.tmp, "runtimes")
         ug.is_root = lambda: False
+        # _docker is faked below, so the privilege check must not probe the
+        # real daemon — otherwise these tests only pass where Docker runs
+        ug.have_docker = lambda: True
         ug._staging_dir = lambda: self.tmp
         self.calls = []
 
@@ -427,6 +433,7 @@ class TestRuntimeDeployDockerPath(unittest.TestCase):
     def tearDown(self):
         ug.RUNTIMES_DIR, ug.is_root = self._runtimes, self._root
         ug._staging_dir, ug._docker = self._staging, self._docker
+        ug.have_docker = self._have_docker
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_live_runtime_is_parked_not_deleted(self):
@@ -588,9 +595,10 @@ class TestRuntimeAwareLint(unittest.TestCase):
                            runtime="upstream-b10143")
         self.assertFalse(any("4096" in w for w in warns))
 
-    def test_upstream_underscore_mmap_is_flagged(self):
-        warns = self._lint(["--no_mmap"], runtime="upstream-b10143")
-        self.assertTrue(any("no_mmap" in w for w in warns))
+    def test_upstream_no_mmap_is_flagged_in_both_spellings(self):
+        for flag in ("--no-mmap", "--no_mmap"):
+            warns = self._lint([flag], runtime="upstream-b10143")
+            self.assertTrue(any("no-mmap" in w for w in warns), flag)
 
     def test_vendor_underscore_mmap_is_fine(self):
         self.assertEqual(self._lint(["--no_mmap"]), [])
