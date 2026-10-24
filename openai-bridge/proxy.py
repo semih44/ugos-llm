@@ -15,9 +15,12 @@ What it does, and only when tool use is actually FORCED
             JSON object matching this schema" instruction, cap max_tokens
   response: extract the JSON and re-wrap it as a synthetic tool_call
 
-`tool_choice: "auto"` and `"none"` are passed through untouched — the
-gateway handles those natively. Non-tool requests, including streaming, are
-proxied verbatim.
+Enabled thinking splits this into an analysis call and a JSON-only call that
+share the same token cap; thinking-off keeps the original single-call path.
+
+`tool_choice: "auto"` and `"none"` skip tool emulation — the gateway handles
+those natively. Non-tool requests, including streaming, are proxied directly;
+only the optional thinking controls below may inject request kwargs.
 
 The gateway itself has NO authentication, so if you bind this bridge
 anywhere reachable from your network, set API_KEY — the bridge then becomes
@@ -31,9 +34,11 @@ Configuration (env):
   UPSTREAM      default http://127.0.0.1:62891
   API_KEY       default empty (no auth). When set, every request must carry
                 `Authorization: Bearer <key>`. Required to bind anything
-                other than loopback or a docker bridge address.
+                other than loopback or a confirmed docker bridge address.
   ALLOW_UNAUTHENTICATED  set to 1 to bind a LAN address without a key.
                 Do not. It publishes an open LLM endpoint to your network.
+  THINKING_DEFAULT on|off|empty. Client kwargs and reasoning_effort win;
+                empty leaves plain requests alone and emulated tools off.
   MAX_TOKENS    default 1024   (hard cap, clamps larger client values)
   TIMEOUT       default 570    (seconds; keep below your client timeout)
   MAX_BODY      default 33554432 (32 MiB request limit)
@@ -42,10 +47,13 @@ Run with network_mode: host (see README.md). One log line per request.
 
 License: MIT.
 """
+import fcntl
 import hmac
 import ipaddress
 import json
 import os
+import socket
+import struct
 import time
 import urllib.error
 import urllib.request
@@ -55,12 +63,12 @@ LISTEN = (os.environ.get("LISTEN_HOST", "172.17.0.1"),
           int(os.environ.get("LISTEN_PORT", "11434")))
 UPSTREAM = os.environ.get("UPSTREAM", "http://127.0.0.1:62891").rstrip("/")
 API_KEY = os.environ.get("API_KEY", "")
-# "on" | "off" | "" (leave requests alone). Injected at request level
-# because that is the only level that reliably reaches the model: the UGOS
-# gateway swallows llama-server's own --chat-template-kwargs default
-# (verified: argv intact, /props kwargs empty), while request-level
-# chat_template_kwargs demonstrably win. Clients that send their own kwargs
-# always take precedence; emulated tool requests are always pinned off.
+# "on" | "off" | "" (leave plain requests alone; emulated tools default off).
+# Injected at request level because that is the only level that reliably
+# reaches the model: the UGOS gateway swallows llama-server's own
+# --chat-template-kwargs default (verified: argv intact, /props kwargs empty),
+# while request-level chat_template_kwargs demonstrably win. Client kwargs and
+# reasoning_effort take precedence over this configured default.
 THINKING_DEFAULT = os.environ.get("THINKING_DEFAULT", "").lower()
 
 # OpenAI-style reasoning_effort (what VS Code's thinking-effort picker
@@ -70,9 +78,13 @@ EFFORT_OFF = {"none", "minimal", "low"}
 EFFORT_ON = {"medium", "high", "xhigh", "max"}
 
 
-def thinking_kwargs(data):
-    """The chat_template_kwargs to inject for a plain chat request, or None
-    to leave the request untouched. Client-supplied kwargs always win."""
+def thinking_kwargs(data, emulated=False):
+    """The chat_template_kwargs to inject, or None to preserve client kwargs.
+
+    An explicit instance default applies to plain and emulated requests. With
+    no configured default, only emulated tool requests are pinned off so their
+    capped token budget stays available for JSON.
+    """
     if "chat_template_kwargs" in data:
         return None
     effort = str(data.get("reasoning_effort", "")).lower()
@@ -82,7 +94,11 @@ def thinking_kwargs(data):
         return {"enable_thinking": False}
     if THINKING_DEFAULT in ("on", "off"):
         return {"enable_thinking": THINKING_DEFAULT == "on"}
+    if emulated:
+        return {"enable_thinking": False}
     return None
+
+
 ALLOW_UNAUTHENTICATED = (os.environ.get("ALLOW_UNAUTHENTICATED", "").lower()
                          not in ("", "0", "false", "no"))
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "1024"))
@@ -101,6 +117,21 @@ MULTI_INSTR = (
     "\"arguments\" matches that function's schema. No markdown, no code "
     "fences, no text before or after. Functions:\n{catalog}"
 )
+SINGLE_ANALYSIS_INSTR = (
+    "\n\nAnalyze the user's request for the function {name} using this JSON "
+    "schema. Think carefully, then finish with a concise plain-text summary "
+    "of the arguments you intend to return. Do not output JSON:\n{schema}"
+)
+MULTI_ANALYSIS_INSTR = (
+    "\n\nChoose exactly one of the following functions. Think carefully, then "
+    "finish with a concise plain-text summary of the chosen function and "
+    "arguments. Do not output JSON. Functions:\n{catalog}"
+)
+FINAL_INSTR = (
+    "Use the analysis above and output exactly the JSON object requested "
+    "earlier. No markdown, code fences, or other text."
+)
+ANALYSIS_MAX_CHARS = 6000
 
 
 class BadRequest(ValueError):
@@ -148,6 +179,29 @@ def check_auth(header, key):
     return hmac.compare_digest(token.encode("utf-8"), key.encode("utf-8"))
 
 
+def _docker_bridge_addresses():
+    """IPv4 addresses actually assigned to Docker-created bridge interfaces."""
+    try:
+        interfaces = socket.if_nameindex()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    except (AttributeError, OSError):
+        return set()
+    addresses = set()
+    with sock:
+        for _, name in interfaces:
+            if name not in ("docker0", "docker_gwbridge") \
+                    and not name.startswith("br-"):
+                continue
+            try:
+                request = struct.pack("256s", name.encode("utf-8")[:15])
+                # Linux SIOCGIFADDR; no `ip` binary in the Alpine image.
+                response = fcntl.ioctl(sock.fileno(), 0x8915, request)
+            except OSError:
+                continue
+            addresses.add(socket.inet_ntoa(response[20:24]))
+    return addresses
+
+
 def _is_local_bind(host):
     """True for addresses only this machine (or its containers) can reach."""
     if host == "localhost":
@@ -158,9 +212,9 @@ def _is_local_bind(host):
         return False                      # "" and 0.0.0.0-style wildcards
     if ip.is_loopback:
         return True
-    # docker bridge networks: reachable by containers on this host but not
-    # from the LAN. This is the shipped default and must keep working.
-    return ip.version == 4 and ip in ipaddress.ip_network("172.16.0.0/12")
+    # A private range alone proves nothing: the NAS itself may use 172.16/12
+    # on its LAN. Only a real Docker interface keeps the no-auth default safe.
+    return str(ip) in _docker_bridge_addresses()
 
 
 def guard_bind(host, key, allow_unauth):
@@ -246,6 +300,45 @@ def extract_json(text):
     return candidate
 
 
+def tool_prompt(p, analysis=False):
+    kind, payload = p
+    if kind == "single":
+        fn = payload["function"]
+        schema = json.dumps(scrub_schema(
+            fn.get("parameters") or {"type": "object"}))
+        instr = (SINGLE_ANALYSIS_INSTR.format(name=fn["name"], schema=schema)
+                 if analysis else SINGLE_INSTR.format(schema=schema))
+        note = f"emulate:{fn['name']}"
+    else:
+        names = ", ".join(t["function"]["name"] for t in payload)
+        catalog = "\n".join(
+            f"- {t['function']['name']}: {t['function'].get('description','')}"
+            f"\n  schema: "
+            f"{json.dumps(scrub_schema(t['function'].get('parameters') or {}))}"
+            for t in payload)
+        instr = (MULTI_ANALYSIS_INSTR.format(catalog=catalog)
+                 if analysis else MULTI_INSTR.format(names=names,
+                                                     catalog=catalog))
+        note = f"emulate:{len(payload)}-tools"
+    return instr, note
+
+
+def append_instruction(data, instr):
+    msgs = data.get("messages")
+    if not isinstance(msgs, list):
+        raise BadRequest("'messages' must be an array")
+    if msgs and isinstance(msgs[-1], dict) \
+            and isinstance(msgs[-1].get("content"), str):
+        msgs[-1]["content"] += instr
+    else:
+        msgs.append({"role": "user", "content": instr})
+
+
+def emulated_thinking(data):
+    kwargs = data.get("chat_template_kwargs")
+    return isinstance(kwargs, dict) and kwargs.get("enable_thinking") is True
+
+
 def rewrite(body, path):
     """Returns (new_body, note, plan_or_None)."""
     if not path.startswith("/v1/chat/completions"):
@@ -265,37 +358,16 @@ def rewrite(body, path):
                     note + f",{state}", None)
         return body, note, None
 
-    kind, payload = p
-    if kind == "single":
-        fn = payload["function"]
-        schema = scrub_schema(fn.get("parameters") or {"type": "object"})
-        instr = SINGLE_INSTR.format(schema=json.dumps(schema))
-        note = f"emulate:{fn['name']}"
-    else:
-        names = ", ".join(t["function"]["name"] for t in payload)
-        catalog = "\n".join(
-            f"- {t['function']['name']}: {t['function'].get('description','')}"
-            f"\n  schema: "
-            f"{json.dumps(scrub_schema(t['function'].get('parameters') or {}))}"
-            for t in payload)
-        instr = MULTI_INSTR.format(names=names, catalog=catalog)
-        note = f"emulate:{len(payload)}-tools"
-
+    instr, note = tool_prompt(p)
     data.pop("tools", None)
     data.pop("tool_choice", None)
     data.pop("parallel_tool_calls", None)
-    # Emulated requests are budget-capped JSON extractions. If the server's
-    # default is enable_thinking:true, reasoning would eat that budget before
-    # any JSON appears — pin it off here, unless the client asked otherwise.
-    data.setdefault("chat_template_kwargs", {"enable_thinking": False})
-    msgs = data.get("messages")
-    if not isinstance(msgs, list):
-        raise BadRequest("'messages' must be an array")
-    if msgs and isinstance(msgs[-1], dict) \
-            and isinstance(msgs[-1].get("content"), str):
-        msgs[-1]["content"] += instr
-    else:
-        msgs.append({"role": "user", "content": instr})
+    # Emulated requests default to thinking off. Enabled thinking uses a
+    # separate analysis request so it cannot consume the JSON token budget.
+    kw = thinking_kwargs(data, emulated=True)
+    if kw is not None:
+        data["chat_template_kwargs"] = kw
+    append_instruction(data, instr)
 
     # hard cap, not a default — and strictly a positive JSON integer
     requested = data.get("max_tokens")
@@ -306,10 +378,67 @@ def rewrite(body, path):
     elif requested < 1:
         raise BadRequest("'max_tokens' must be >= 1")
     data["max_tokens"] = min(requested, MAX_TOKENS)
+    if emulated_thinking(data) and data["max_tokens"] < 2:
+        raise BadRequest("thinking tool emulation needs max_tokens >= 2")
     # emulation needs the whole answer before it can be wrapped
     if data.pop("stream", False):
         note += ",stream-disabled"
     return json.dumps(data).encode("utf-8"), note, p
+
+
+def thinking_analysis_request(source_body, final_body, p):
+    """Build the thinking half of a two-stage forced-tool request."""
+    source = json.loads(source_body)
+    final = json.loads(final_body)
+    analysis = dict(final)
+    analysis["messages"] = source.get("messages")
+    analysis["max_tokens"] = final["max_tokens"] // 2
+    instr, _ = tool_prompt(p, analysis=True)
+    append_instruction(analysis, instr)
+    return json.dumps(analysis).encode("utf-8")
+
+
+def extract_analysis(payload):
+    response = json.loads(payload)
+    message = response["choices"][0]["message"]
+    content = (message.get("content") or "").strip()
+    reasoning = (message.get("reasoning_content") or "").strip()
+    analysis = content or reasoning
+    if not analysis:
+        raise ValueError("model returned no analysis for the final JSON step")
+    return analysis[-ANALYSIS_MAX_CHARS:]
+
+
+def thinking_final_request(final_body, analysis):
+    """Build the JSON-only half, preserving the combined token cap."""
+    final = json.loads(final_body)
+    cap = final["max_tokens"]
+    final["max_tokens"] = cap - cap // 2
+    kwargs = dict(final.get("chat_template_kwargs") or {})
+    kwargs["enable_thinking"] = False
+    final["chat_template_kwargs"] = kwargs
+    final.pop("reasoning_effort", None)
+    final["messages"] += [
+        {"role": "assistant", "content": analysis},
+        {"role": "user", "content": FINAL_INSTR},
+    ]
+    return json.dumps(final).encode("utf-8")
+
+
+def merge_usage(analysis_payload, final_payload):
+    """Report both upstream calls in the final OpenAI usage object."""
+    analysis = json.loads(analysis_payload)
+    final = json.loads(final_payload)
+    first = analysis.get("usage") or {}
+    second = final.get("usage") or {}
+    if not isinstance(first, dict) or not isinstance(second, dict):
+        return final_payload
+    usage = dict(second)
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        if isinstance(first.get(key), int) and isinstance(second.get(key), int):
+            usage[key] = first[key] + second[key]
+    final["usage"] = usage
+    return json.dumps(final).encode("utf-8")
 
 
 def check_required(args_json, tool):
@@ -384,9 +513,22 @@ class Handler(BaseHTTPRequestHandler):
               f"from {self.client_address[0]} "
               f"({auth_shape(self.headers)})", flush=True)
 
+    def _upstream_request(self, body):
+        req = urllib.request.Request(UPSTREAM + self.path, data=body,
+                                     method=self.command)
+        # When we authenticate, we ARE the boundary: the client's credential
+        # is ours to check and stops here rather than travelling upstream.
+        forward = ("Content-Type", "Accept") if API_KEY \
+            else ("Content-Type", "Authorization", "Accept")
+        for h in forward:
+            if self.headers.get(h):
+                req.add_header(h, self.headers[h])
+        return req
+
     def _proxy(self, body=None):
         t0 = time.time()
         note, p = "-", None
+        source_body = body
         if body is not None:
             try:
                 body, note, p = rewrite(body, self.path)
@@ -404,40 +546,52 @@ class Handler(BaseHTTPRequestHandler):
                 print(f"{self.command} {self.path} [rewrite-error] -> 400 "
                       f"({type(e).__name__}: {e})", flush=True)
                 return
-        req = urllib.request.Request(UPSTREAM + self.path, data=body,
-                                     method=self.command)
-        # When we authenticate, we ARE the boundary: the client's credential
-        # is ours to check and stops here rather than travelling upstream.
-        forward = ("Content-Type", "Accept") if API_KEY \
-            else ("Content-Type", "Authorization", "Accept")
-        for h in forward:
-            if self.headers.get(h):
-                req.add_header(h, self.headers[h])
         status = 502
         try:
-            with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
-                status = r.status
-                ctype = r.headers.get("Content-Type", "application/json")
-                if p is None and "text/event-stream" in ctype:
-                    # Stream passthrough. Without Content-Length the client
-                    # can only detect the end via connection close — announce
-                    # and enforce that, or HTTP/1.1 keep-alive hangs forever.
-                    self.close_connection = True
-                    self.send_response(status)
-                    self.send_header("Content-Type", ctype)
-                    self.send_header("Cache-Control", "no-cache")
-                    self.send_header("Connection", "close")
-                    self.end_headers()
-                    # readline() returns as soon as an event line is complete,
-                    # so events reach the client while they happen. read(n)
-                    # would block until the buffer fills or upstream closes.
-                    for line in r:
-                        self.wfile.write(line)
-                        self.wfile.flush()
-                    print(f"{self.command} {self.path} [{note},sse] -> "
-                          f"{status} in {time.time()-t0:.1f}s", flush=True)
-                    return
-                payload = r.read()
+            if p is not None and emulated_thinking(json.loads(body)):
+                note += ",thinking-2stage"
+                analysis_body = thinking_analysis_request(source_body, body, p)
+                with urllib.request.urlopen(
+                        self._upstream_request(analysis_body),
+                        timeout=TIMEOUT) as r:
+                    analysis_payload = r.read()
+                analysis = extract_analysis(analysis_payload)
+                final_body = thinking_final_request(body, analysis)
+                remaining = TIMEOUT - (time.time() - t0)
+                if remaining <= 0:
+                    raise TimeoutError("two-stage tool emulation timed out")
+                with urllib.request.urlopen(
+                        self._upstream_request(final_body),
+                        timeout=remaining) as r:
+                    status = r.status
+                    ctype = r.headers.get("Content-Type", "application/json")
+                    payload = r.read()
+                payload = merge_usage(analysis_payload, payload)
+            else:
+                with urllib.request.urlopen(
+                        self._upstream_request(body), timeout=TIMEOUT) as r:
+                    status = r.status
+                    ctype = r.headers.get("Content-Type", "application/json")
+                    if p is None and "text/event-stream" in ctype:
+                        # Stream passthrough. Without Content-Length the client
+                        # can only detect the end via connection close — announce
+                        # and enforce that, or HTTP/1.1 keep-alive hangs forever.
+                        self.close_connection = True
+                        self.send_response(status)
+                        self.send_header("Content-Type", ctype)
+                        self.send_header("Cache-Control", "no-cache")
+                        self.send_header("Connection", "close")
+                        self.end_headers()
+                        # readline() returns as soon as an event line is complete,
+                        # so events reach the client while they happen. read(n)
+                        # would block until the buffer fills or upstream closes.
+                        for line in r:
+                            self.wfile.write(line)
+                            self.wfile.flush()
+                        print(f"{self.command} {self.path} [{note},sse] -> "
+                              f"{status} in {time.time()-t0:.1f}s", flush=True)
+                        return
+                    payload = r.read()
         except urllib.error.HTTPError as e:
             payload, status = e.read(), e.code
             ctype = e.headers.get("Content-Type", "application/json")

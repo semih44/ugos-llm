@@ -873,6 +873,28 @@ def loaded_servers():
     return hits
 
 
+def model_is_loaded(name):
+    return any(n == name for n, _ in loaded_servers())
+
+
+def tool_call_matches(calls, name, expected):
+    """Require exactly one native call with the expected name and arguments."""
+    if not isinstance(calls, list) or len(calls) != 1:
+        return False
+    try:
+        function = calls[0]["function"]
+        if function.get("name") != name:
+            return False
+        args = function.get("arguments")
+        if isinstance(args, str):
+            args = json.loads(args)
+    except (AttributeError, KeyError, IndexError, TypeError,
+            json.JSONDecodeError):
+        return False
+    return isinstance(args, dict) and all(
+        args.get(key) == value for key, value in expected.items())
+
+
 def collapse_score(text):
     """Uniqueness of 4-grams; below 0.5 means degenerated repetition."""
     w = text.split()
@@ -1039,8 +1061,13 @@ def cmd_install(args):
     name = validate_name(
         args.name or re.sub(r"-?GGUF$", "", repo.split("/")[-1], flags=re.I))
     target = os.path.join(MODELS_DIR, name)
-    if os.path.exists(target) and not args.force:
+    target_exists = os.path.exists(target)
+    if target_exists and not args.force:
         die(f"{target} already exists (use --force to replace, or --name).")
+    if target_exists and model_is_loaded(name):
+        die(f"{name} is currently loaded. Disable it in Model Manager "
+            "(or reboot) before replacing it; nothing was changed or "
+            "downloaded. Never kill llama-server processes.")
 
     # validate the runtime/draft/thinking combination BEFORE any network
     # traffic — failing after a 14 GB download helps nobody
@@ -1275,6 +1302,7 @@ def cmd_test(args):
         die("gateway unreachable on 127.0.0.1:62891")
     if not any(i.startswith(name + "/") for i in ids):
         die(f"gateway does not list {name}. Installed? Reloaded?")
+    runtime = model_runtime_markers().get(name, "vendor")
 
     def chat(msgs, **kw):
         p = {"model": model_id, "messages": msgs, "max_tokens": 200,
@@ -1299,7 +1327,8 @@ def cmd_test(args):
     txt, _, dt = chat([{"role": "user", "content":
                         para + "\n\nIn welchem Jahr wurde die Halle "
                         "errichtet? Antworte in einem Satz."}])
-    results.append(("long-prompt", collapse_score(txt) > 0.5, dt, txt[:80]))
+    results.append(("long-prompt",
+                    collapse_score(txt) > 0.5 and "1987" in txt, dt, txt[:80]))
 
     log("3/4 tool-calling ...")
     tool = {"type": "function", "function": {
@@ -1313,10 +1342,19 @@ def cmd_test(args):
     txt, calls, dt = chat([{"role": "user",
                             "content": "Wie viel Speicherplatz ist noch frei?"}],
                           tools=[tool])
-    ok = bool(calls) or (collapse_score(txt) > 0.5 and len(txt) > 10)
-    results.append(("tools", ok, dt,
-                    f"tool_call {calls[0]['function']['name']}" if calls
-                    else txt[:80]))
+    ok = tool_call_matches(calls, "get_system_info", {"category": "storage"})
+    if not calls and not runtime.startswith("upstream-"):
+        ok = None
+    if calls:
+        try:
+            detail = f"tool_call {calls[0]['function']['name']}"
+        except (AttributeError, KeyError, IndexError, TypeError):
+            detail = "malformed tool_call"
+    elif ok is None:
+        detail = "native tools unsupported on vendor runtime; use openai-bridge"
+    else:
+        detail = txt[:80]
+    results.append(("tools", ok, dt, detail))
 
     log("4/4 vision (skipped unless --vision) ...")
     if args.vision:
@@ -1339,11 +1377,14 @@ def cmd_test(args):
                         "rot" in txt.lower() or "red" in txt.lower(),
                         dt, txt[:40]))
 
+    def verdict(ok):
+        return "SKIP" if ok is None else ("PASS" if ok else "FAIL")
+
     log("")
     fails = 0
     for label, ok, dt, detail in results:
-        fails += 0 if ok else 1
-        log(f"  {'PASS' if ok else 'FAIL':4s} {label:12s} {dt:5.1f}s  {detail}")
+        fails += 1 if ok is False else 0
+        log(f"  {verdict(ok):4s} {label:12s} {dt:5.1f}s  {detail}")
 
     # copy-pasteable block for a "Model compatibility report" issue
     arch = size_gb = "?"
@@ -1366,14 +1407,15 @@ def cmd_test(args):
     log(f"model: {name} | arch: {arch} | file: {size_gb} | ub: {ub}")
     log(f"device: {device}")
     for label, ok, dt, _ in results:
-        log(f"{label}: {'PASS' if ok else 'FAIL'} ({dt:.1f}s)")
+        log(f"{label}: {verdict(ok)} ({dt:.1f}s)")
     log("---------------------------------------------------------")
     log("")
     if fails:
         log("Some checks failed — see docs/known-bugs.md. Usual suspects: "
             "ub=4096 configs, MoE or unsupported architectures.")
         sys.exit(1)
-    log("All checks passed. Please consider filing a model report "
+    supported = " supported" if any(ok is None for _, ok, _, _ in results) else ""
+    log(f"All{supported} checks passed. Please consider filing a model report "
         "(docs/compatibility.md).")
 
 
@@ -1690,14 +1732,17 @@ def cmd_remove(args):
         die(f"{target} does not exist")
     if not args.yes:
         die(f"refusing without --yes (would delete {target})")
+    if model_is_loaded(name):
+        die(f"{name} is currently loaded. Disable it in Model Manager "
+            "(or reboot) before removing it; nothing was changed. "
+            "Never kill llama-server processes.")
     if not args.keep_ui:
         try:
             ui_remove(name)
         except SystemExit:
             log("(catalog row left untouched)")
     priv_remove_dir(name)
-    log(f"{name} removed. A loaded server keeps running until the next "
-        "reload (UI toggle or reboot).")
+    log(f"{name} removed.")
 
 
 # --------------------------------------------------------------------------

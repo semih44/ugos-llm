@@ -5,6 +5,7 @@ architecture rules, split detection, and the proxy's rewrite logic.
 
 Run: python3 -m unittest discover -s tests -v
 """
+import contextlib
 import importlib.util
 import io
 import json
@@ -239,6 +240,138 @@ class TestProxyWrap(unittest.TestCase):
             px.wrap_as_tool_call(self._resp("I am prose."), ("single", TOOL_A))
 
 
+class TestPaperlessContract(unittest.TestCase):
+    def test_forced_classification_request_and_response(self):
+        tool = {"type": "function", "function": {
+            "name": "DocumentClassifierSchema",
+            "description": "Classification suggestions for a single document.",
+            "strict": False,
+            "parameters": {"type": "object", "additionalProperties": False,
+                           "required": ["title"],
+                           "properties": {
+                               "title": {"type": "string", "maxLength": 128},
+                               "tags": {"type": "array", "maxItems": 8,
+                                        "items": {"type": "string"}},
+                               "tag_ids": {"type": "array", "maxItems": 10,
+                                           "items": {"type": "integer"}}}}}}
+        payload = {
+            "model": "Qwen3.5-9B/Qwen3.5-9B", "stream": False,
+            "temperature": 0.7, "top_p": 0.8, "top_k": 20, "min_p": 0.0,
+            "messages": [{"role": "user", "content":
+                          "Classify bridge-test.txt\n\nAnswer by calling the "
+                          "DocumentClassifierSchema tool. Do not write text."}],
+            "tools": [tool], "tool_choice": "required",
+            "parallel_tool_calls": True,
+        }
+        original_default = px.THINKING_DEFAULT
+        px.THINKING_DEFAULT = ""
+        try:
+            data, _, plan = rw(payload)
+        finally:
+            px.THINKING_DEFAULT = original_default
+
+        self.assertEqual(plan, ("single", tool))
+        for key in ("temperature", "top_p", "top_k", "min_p"):
+            self.assertEqual(data[key], payload[key])
+        self.assertNotIn("parallel_tool_calls", data)
+        self.assertNotIn("stream", data)
+        self.assertEqual(data["max_tokens"], px.MAX_TOKENS)
+        self.assertEqual(data["chat_template_kwargs"], {"enable_thinking": False})
+        prompt = data["messages"][-1]["content"]
+        self.assertIn("DocumentClassifierSchema", prompt)
+        self.assertIn("additionalProperties", prompt)
+        self.assertNotIn('"strict"', prompt)
+
+        response = json.dumps({"choices": [{
+            "index": 0, "finish_reason": "stop",
+            "message": {"role": "assistant", "content": json.dumps({
+                "title": "Rechnung 2026", "tags": ["Rechnung"], "tag_ids": [7]
+            })}}]}).encode()
+        out = json.loads(px.wrap_as_tool_call(response, plan))
+        message = out["choices"][0]["message"]
+        self.assertIsNone(message["content"])
+        self.assertEqual(len(message["tool_calls"]), 1)
+        call = message["tool_calls"][0]["function"]
+        self.assertEqual(call["name"], "DocumentClassifierSchema")
+        self.assertIsInstance(call["arguments"], str)
+        args = json.loads(call["arguments"])
+        self.assertEqual(args["title"], "Rechnung 2026")
+        self.assertEqual(args["tag_ids"], [7])
+
+
+class TestTwoStageThinking(unittest.TestCase):
+    def setUp(self):
+        self.source = json.dumps({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "tools": [TOOL_A], "tool_choice": "required",
+            "reasoning_effort": "high", "max_tokens": 201,
+        }).encode()
+        self.body, _, self.plan = px.rewrite(
+            self.source, "/v1/chat/completions")
+
+    def test_analysis_uses_half_budget_without_json_instruction(self):
+        body = px.thinking_analysis_request(self.source, self.body, self.plan)
+        data = json.loads(body)
+        self.assertEqual(data["max_tokens"], 100)
+        self.assertTrue(data["chat_template_kwargs"]["enable_thinking"])
+        prompt = data["messages"][-1]["content"]
+        self.assertIn("concise plain-text summary", prompt)
+        self.assertNotIn("EXACTLY ONE valid JSON object", prompt)
+        self.assertNotIn("tools", data)
+
+    def test_final_disables_thinking_and_preserves_total_cap(self):
+        analysis_payload = json.dumps({"choices": [{"message": {
+            "content": "", "reasoning_content": "reasoning trace"}}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 100,
+                      "total_tokens": 200}}).encode()
+        analysis = px.extract_analysis(analysis_payload)
+        self.assertEqual(analysis, "reasoning trace")
+        final = json.loads(px.thinking_final_request(self.body, analysis))
+        self.assertEqual(final["max_tokens"], 101)
+        self.assertEqual(final["max_tokens"] + 100, 201)
+        self.assertFalse(final["chat_template_kwargs"]["enable_thinking"])
+        self.assertNotIn("reasoning_effort", final)
+        self.assertEqual(final["messages"][-2],
+                         {"role": "assistant", "content": "reasoning trace"})
+        self.assertEqual(final["messages"][-1]["content"], px.FINAL_INSTR)
+
+        final_payload = json.dumps({
+            "usage": {"prompt_tokens": 20, "completion_tokens": 11,
+                      "total_tokens": 31}}).encode()
+        usage = json.loads(px.merge_usage(analysis_payload, final_payload))["usage"]
+        self.assertEqual(usage, {"prompt_tokens": 120,
+                                 "completion_tokens": 111, "total_tokens": 231})
+
+    def test_analysis_prefers_summary_and_bounds_reasoning(self):
+        summary = json.dumps({"choices": [{"message": {
+            "content": " short summary ", "reasoning_content": "long trace"}}]})
+        self.assertEqual(px.extract_analysis(summary), "short summary")
+        long = json.dumps({"choices": [{"message": {
+            "content": "", "reasoning_content": "x" * 7000}}]})
+        self.assertEqual(len(px.extract_analysis(long)), px.ANALYSIS_MAX_CHARS)
+
+    def test_multi_tool_analysis_keeps_full_catalog(self):
+        source = json.dumps({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "tools": [TOOL_A, TOOL_B], "tool_choice": "required",
+            "reasoning_effort": "high", "max_tokens": 100,
+        }).encode()
+        body, _, plan = px.rewrite(source, "/v1/chat/completions")
+        analysis = json.loads(px.thinking_analysis_request(source, body, plan))
+        prompt = analysis["messages"][-1]["content"]
+        self.assertIn("alpha", prompt)
+        self.assertIn("beta", prompt)
+        self.assertIn("concise plain-text summary", prompt)
+
+    def test_tiny_two_stage_budget_is_rejected(self):
+        source = json.dumps({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "tools": [TOOL_A], "tool_choice": "required",
+            "reasoning_effort": "high", "max_tokens": 1,
+        }).encode()
+        with self.assertRaises(px.BadRequest):
+            px.rewrite(source, "/v1/chat/completions")
+
 
 class TestProxyHardening(unittest.TestCase):
     """Malformed input must produce clean errors, never crashes or
@@ -321,6 +454,151 @@ class TestCLIValidation(unittest.TestCase):
             ["install", "o/r", "--ubatch", "1024"])
         with self.assertRaises(SystemExit):
             ug.cmd_install(args)
+
+
+class TestModelLifecycleGuards(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.models = os.path.join(self.tmp, "models")
+        os.makedirs(os.path.join(self.models, "M"))
+        self._original = (ug.MODELS_DIR, ug.loaded_servers, ug.hf_repo_files,
+                          ug.ui_remove, ug.priv_remove_dir)
+        ug.MODELS_DIR = self.models
+        self.loaded = []
+        ug.loaded_servers = lambda: list(self.loaded)
+        self.network = []
+        ug.hf_repo_files = lambda repo: self.network.append(repo) or []
+        self.removals = []
+        ug.ui_remove = lambda name: self.removals.append(("ui", name))
+        ug.priv_remove_dir = lambda name: self.removals.append(("files", name))
+
+    def tearDown(self):
+        (ug.MODELS_DIR, ug.loaded_servers, ug.hf_repo_files,
+         ug.ui_remove, ug.priv_remove_dir) = self._original
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_force_reinstall_refuses_loaded_before_network(self):
+        self.loaded = [("M", "512")]
+        args = ug.build_parser().parse_args(
+            ["install", "o/r", "--name", "M", "--force"])
+        with contextlib.redirect_stderr(io.StringIO()), \
+                self.assertRaises(SystemExit):
+            ug.cmd_install(args)
+        self.assertEqual(self.network, [])
+        self.assertEqual(self.removals, [])
+
+    def test_force_reinstall_unloaded_continues(self):
+        args = ug.build_parser().parse_args(
+            ["install", "o/r", "--name", "M", "--force"])
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors), self.assertRaises(SystemExit):
+            ug.cmd_install(args)
+        self.assertEqual(self.network, ["o/r"])
+        self.assertIn("no GGUF", errors.getvalue())
+
+    def test_remove_refuses_loaded_before_ui_or_files(self):
+        self.loaded = [("M", "512")]
+        args = ug.build_parser().parse_args(["remove", "M", "--yes"])
+        with contextlib.redirect_stderr(io.StringIO()), \
+                self.assertRaises(SystemExit):
+            ug.cmd_remove(args)
+        self.assertEqual(self.removals, [])
+        self.assertTrue(os.path.isdir(os.path.join(self.models, "M")))
+
+    def test_remove_unloaded_proceeds(self):
+        args = ug.build_parser().parse_args(["remove", "M", "--yes"])
+        with contextlib.redirect_stdout(io.StringIO()):
+            ug.cmd_remove(args)
+        self.assertEqual(self.removals, [("ui", "M"), ("files", "M")])
+
+
+class TestAcceptanceSuite(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._original = (ug.MODELS_DIR, ug.gw_models, ug.gw,
+                          ug.model_runtime_markers, ug.loaded_servers)
+        ug.MODELS_DIR = self.tmp
+        ug.gw_models = lambda: ["M/M"]
+        ug.gw = self._gw
+        self.runtime = {"M": "upstream-b11790"}
+        ug.model_runtime_markers = lambda: dict(self.runtime)
+        ug.loaded_servers = lambda: []
+        self.long_answer = "Die Lagerhalle wurde 1987 errichtet."
+        self.tool_text = ""
+        self.calls = [{"type": "function", "function": {
+            "name": "get_system_info",
+            "arguments": json.dumps({"category": "storage"})}}]
+
+    def tearDown(self):
+        (ug.MODELS_DIR, ug.gw_models, ug.gw,
+         ug.model_runtime_markers, ug.loaded_servers) = self._original
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _gw(self, path, payload=None, timeout=300):
+        prompt = payload["messages"][-1]["content"]
+        if payload.get("tools"):
+            content, calls = self.tool_text, self.calls
+        elif "Lagerhalle" in prompt:
+            content, calls = self.long_answer, None
+        else:
+            content, calls = "Ein NAS speichert Daten im Netzwerk.", None
+        return {"choices": [{"message": {
+            "content": content, "tool_calls": calls}}]}
+
+    def _run(self, expect_fail=False):
+        args = ug.build_parser().parse_args(["test", "M"])
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            if expect_fail:
+                with self.assertRaises(SystemExit) as caught:
+                    ug.cmd_test(args)
+                self.assertEqual(caught.exception.code, 1)
+            else:
+                ug.cmd_test(args)
+        return output.getvalue()
+
+    def test_correct_answers_pass(self):
+        output = self._run()
+        self.assertIn("PASS long-prompt", output)
+        self.assertIn("PASS tools", output)
+        self.assertIn("All checks passed", output)
+
+    def test_fluent_wrong_long_prompt_fails(self):
+        self.long_answer = ("Die Lagerhalle wurde 2015 errichtet und mehrfach "
+                            "modernisiert.")
+        self.assertGreater(ug.collapse_score(self.long_answer), 0.5)
+        output = self._run(expect_fail=True)
+        self.assertIn("FAIL long-prompt", output)
+
+    def test_missing_tool_call_fails_upstream(self):
+        self.calls = None
+        self.tool_text = "Ich kann dabei leider nicht helfen."
+        output = self._run(expect_fail=True)
+        self.assertIn("FAIL tools", output)
+
+    def test_missing_tool_call_skips_vendor(self):
+        self.runtime = {}
+        self.calls = None
+        self.tool_text = "Ich kann dabei leider nicht helfen."
+        output = self._run()
+        self.assertIn("SKIP tools", output)
+        self.assertIn("use openai-bridge", output)
+        self.assertIn("All supported checks passed", output)
+
+    def test_wrong_or_malformed_tool_calls_fail(self):
+        cases = (
+            ("wrong-name", [{"function": {
+                "name": "other", "arguments": '{"category":"storage"}'}}]),
+            ("wrong-arguments", [{"function": {
+                "name": "get_system_info", "arguments": '{"category":"cpu"}'}}]),
+            ("malformed", [{"function": {
+                "name": "get_system_info", "arguments": "not-json"}}]),
+        )
+        for label, calls in cases:
+            with self.subTest(case=label):
+                self.calls = calls
+                output = self._run(expect_fail=True)
+                self.assertIn("FAIL tools", output)
 
 
 class TestPickMmproj(unittest.TestCase):

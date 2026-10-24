@@ -73,10 +73,8 @@ class TestCheckAuth(unittest.TestCase):
 
 
 class TestThinkingSuppression(unittest.TestCase):
-    """Emulated tool requests are budget-capped JSON extractions — a server
-    whose default is enable_thinking:true would burn that budget on
-    reasoning. The bridge therefore pins thinking off for exactly the
-    requests it rewrites, and only those."""
+    """Emulated tool requests default to thinking off so their capped token
+    budget stays available for JSON. Explicit client choices still win."""
 
     base = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
     TOOL = {"type": "function", "function": {
@@ -159,15 +157,13 @@ class TestThinkingDefault(unittest.TestCase):
         self.assertEqual(data["chat_template_kwargs"],
                          {"enable_thinking": False})
 
-    def test_emulated_tool_requests_stay_sober_even_with_default_on(self):
-        # the whole point: Paperless-style JSON extraction must never burn
-        # its token budget on reasoning, whatever the instance default is
+    def test_emulated_tool_requests_honor_default_on(self):
         px.THINKING_DEFAULT = "on"
         data, plan = self._rw(dict(self.base, tools=[self.TOOL],
                                    tool_choice="required"))
         self.assertIsNotNone(plan)
         self.assertEqual(data["chat_template_kwargs"],
-                         {"enable_thinking": False})
+                         {"enable_thinking": True})
 
     def test_reasoning_effort_low_beats_default_on(self):
         # VS Code's thinking-effort picker sends reasoning_effort — the
@@ -207,12 +203,29 @@ class TestThinkingDefault(unittest.TestCase):
         self.assertEqual(data["chat_template_kwargs"],
                          {"enable_thinking": False})
 
-    def test_effort_cannot_unpin_tool_emulation(self):
-        px.THINKING_DEFAULT = "on"
+    def test_effort_can_enable_tool_emulation(self):
+        px.THINKING_DEFAULT = ""
         data, plan = self._rw(dict(self.base, tools=[self.TOOL],
                                    tool_choice="required",
                                    reasoning_effort="high"))
         self.assertIsNotNone(plan)
+        self.assertEqual(data["chat_template_kwargs"],
+                         {"enable_thinking": True})
+
+    def test_client_kwargs_beat_effort_for_tool_emulation(self):
+        px.THINKING_DEFAULT = "on"
+        data, _ = self._rw(dict(
+            self.base, tools=[self.TOOL], tool_choice="required",
+            reasoning_effort="high",
+            chat_template_kwargs={"enable_thinking": False}))
+        self.assertEqual(data["chat_template_kwargs"],
+                         {"enable_thinking": False})
+
+    def test_unknown_effort_keeps_tool_emulation_off_without_default(self):
+        px.THINKING_DEFAULT = ""
+        data, _ = self._rw(dict(self.base, tools=[self.TOOL],
+                                tool_choice="required",
+                                reasoning_effort="turbo"))
         self.assertEqual(data["chat_template_kwargs"],
                          {"enable_thinking": False})
 
@@ -246,6 +259,14 @@ class TestBindGuard(unittest.TestCase):
     """Refusing to start is the only reliable way to stop someone putting an
     unauthenticated LLM endpoint on their LAN."""
 
+    def setUp(self):
+        self._docker_addresses = px._docker_bridge_addresses
+        px._docker_bridge_addresses = lambda: {
+            "172.17.0.1", "172.18.0.1", "172.31.255.1"}
+
+    def tearDown(self):
+        px._docker_bridge_addresses = self._docker_addresses
+
     def test_loopback_without_key_is_allowed(self):
         for host in ("127.0.0.1", "127.0.0.5", "::1", "localhost"):
             with self.subTest(host=host):
@@ -264,7 +285,7 @@ class TestBindGuard(unittest.TestCase):
                     px.guard_bind(host, "", False)
 
     def test_lan_address_without_key_is_refused(self):
-        for host in ("192.168.1.221", "10.0.0.5", "fd00::1"):
+        for host in ("192.168.1.221", "10.0.0.5", "172.20.0.10", "fd00::1"):
             with self.subTest(host=host):
                 with self.assertRaises(SystemExit):
                     px.guard_bind(host, "", False)

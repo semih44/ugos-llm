@@ -34,5 +34,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install ruff
+      - name: Shell syntax
+        run: bash -n scripts/build-runtime.sh scripts/build-runtime-vulkan.sh
+      - name: Shellcheck
+        run: shellcheck scripts/build-runtime.sh scripts/build-runtime-vulkan.sh
+      - run: pip install ruff==0.17.2
       - run: ruff check --select E,F,W --line-length 100 ugos-llm.py openai-bridge/proxy.py tests

@@ -313,6 +313,9 @@ This runs with root privileges on your NAS, so it is built defensively:
   `release_id = 9000`; `remove` refuses to delete anything else.
 - **Never `pkill`.** The gateway does not survive it (reboot required); the CLI
   only ever prints the safe reload paths.
+- **Loaded models are left alone.** `install --force` and `remove` refuse to
+  touch a model whose server is loaded, before any download, catalog or file
+  change. Disable it in Model Manager (or reboot) first.
 - **Versioned helper images** (`alpine:3.20`, `python:3.12-alpine`) instead of
   moving `latest` tags. Version tags are still mutable — for bit-for-bit
   reproducibility override them with digests via `UGOS_LLM_IMG_BUSYBOX` /
@@ -334,7 +337,7 @@ detected and **rejected** rather than half-installed. Pick a single-file quant.
 ## Development
 
 ```bash
-python3 -m unittest discover -s tests -v    # 154 unit tests, stdlib only
+python3 -m unittest discover -s tests -v    # 171 unit tests, stdlib only
 ```
 
 The suite needs neither root nor Docker — every privileged call is faked —
@@ -342,12 +345,14 @@ but it does need a POSIX system (Linux or macOS): the CLI itself relies on
 `fcntl` locks and POSIX rename semantics, because it only ever runs on the
 NAS. Windows is not supported, not even for running the tests.
 
-CI runs the suite on Python 3.9 and 3.12 plus a ruff lint. The risky parts —
-name validation, GGUF header parsing, architecture rules, split detection,
-atomic install/rollback, the runtime dispatcher's routing (executed as real
-bash) and deploy's park-before-replace ordering, plus the proxy's
-rewrite/wrap logic — are covered by tests; the NAS-facing parts are verified
-manually on hardware (see the version banner above).
+CI runs the suite on Python 3.9 and 3.12, a pinned ruff lint, and bash
+syntax/Shellcheck on the runtime recipes. The risky parts — name validation,
+GGUF header parsing, architecture rules, split detection, atomic
+install/rollback, loaded-model guards, strict acceptance verdicts, the
+runtime dispatcher's routing (executed as real bash), deploy's
+park-before-replace ordering, and the proxy's rewrite/wrap logic including
+Paperless-ngx's forced-tool contract — are covered by tests; the NAS-facing
+parts are verified manually on hardware (see the version banner above).
 
 Known limits, stated plainly: the bridge checks that a synthetic tool call
 carries the schema's *required* top-level keys, but it is **not** a JSON Schema

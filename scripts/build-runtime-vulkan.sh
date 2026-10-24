@@ -78,7 +78,7 @@ cp -L "$LIBDIR"/libmd.so.0* "$OUT/" 2>/dev/null || true
 
 echo "=== [5/6] ldd closure — unresolved is a hard error ==="
 GLIBC_RE='^(libc|libm|libdl|libpthread|librt|libresolv|libnsl|libutil|ld-linux|libanl|libnss)'
-for pass in 1 2 3; do
+for _ in 1 2 3; do
   for f in "$OUT"/llama-server "$OUT"/*.so*; do
     [ -f "$f" ] || continue
     ldd "$f" 2>/dev/null | awk '/=>/ {print $1, $3}' | while read -r name path; do

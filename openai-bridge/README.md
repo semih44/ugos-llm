@@ -46,8 +46,8 @@ model           = <DirName>/<DirName>      # e.g. Qwen3.5-9B/Qwen3.5-9B
 
 | Request | Behaviour |
 |---|---|
-| no `tools` | passed through verbatim (including SSE streaming) |
-| `tool_choice: "auto"` / `"none"` | **passed through** — the gateway handles these natively |
+| no `tools` | passed through (including SSE streaming); thinking controls may inject kwargs |
+| `tool_choice: "auto"` / `"none"` | no tool emulation — the gateway handles these natively |
 | `tool_choice: "required"`, one tool | emulated against that tool's schema |
 | `tool_choice: "required"`, several tools | emulated: the model picks one (`{"tool_name":…,"arguments":…}`), the answer is mapped back and validated against the offered names |
 | `tool_choice: {"function": {"name": …}}` | emulated against exactly that tool (a name that isn't in `tools` → HTTP 400, because passing it on would hit the gateway's named-tool hang) |
@@ -59,14 +59,25 @@ your application, as you would with any model output.
 
 Emulated requests get `stream` removed (the answer must be buffered to be
 wrapped) and `max_tokens` clamped to `MAX_TOKENS` — a **hard cap**, larger
-client values are reduced.
+client values are reduced. With thinking enabled, two upstream calls share
+that cap: one half for analysis, the other reserved for JSON. Their `usage`
+is summed in the final response.
+
+Paperless-ngx's forced `DocumentClassifierSchema` request is a dedicated
+regression contract: its sampling fields are preserved, and its response is
+still a standard `tool_calls[0]` with JSON-string arguments and the required
+`title`. Paperless itself needs no patch.
 
 ## Reaching it from another machine (and locking it down)
 
 The gateway has **no authentication of its own**, so the moment you bind
 this bridge to something your LAN can reach, every device on the network can
 use your model. The bridge therefore **refuses to start** on a non-local
-address unless `API_KEY` is set:
+address unless `API_KEY` is set. Only loopback and addresses actually
+assigned to local Docker-created bridge interfaces count as local; belonging
+to a private range such as `172.16.0.0/12` is not enough. The shipped
+`172.17.0.1` Docker default is detected on the NAS and keeps working without
+a key.
 
 ```
 openai-bridge: refusing to bind '192.168.1.221' without authentication.
@@ -148,17 +159,15 @@ with 501).
   thinking-effort picker sends with `"reasoningEffortFormat":
   "chat-completions"`) is translated to `enable_thinking`:
   `none`/`minimal`/`low` → off, `medium` and up → on, unknown values fall
-  back to `THINKING_DEFAULT`. Precedence per request: client
-  `chat_template_kwargs` > `reasoning_effort` > `THINKING_DEFAULT` — and
-  tool emulation pins thinking off above all of them.
+  back to `THINKING_DEFAULT`. Precedence for plain and emulated requests:
+  client `chat_template_kwargs` > `reasoning_effort` > `THINKING_DEFAULT`.
 - `THINKING_DEFAULT=on|off` injects `chat_template_kwargs:
-  {"enable_thinking": …}` into chat requests that don't carry their own —
-  request-level is the only level that works: the UGOS gateway swallows
-  llama-server's own `--chat-template-kwargs` default (verified: argv
-  intact, `/props` kwargs empty), while request-level kwargs win. Clients
-  that send their own kwargs always take precedence, and **emulated tool
-  requests are always pinned to thinking-off** regardless of this setting —
-  reasoning would burn their capped token budget before any JSON appears.
+  {"enable_thinking": …}` when the client made no explicit selection. With
+  no configured default, plain requests stay untouched and emulated tool
+  requests default to thinking-off. Thinking-enabled emulation uses two
+  stages: analysis with thinking, then JSON with thinking disabled. This
+  reserves JSON budget and keeps the OpenAI response unchanged, but adds a
+  second inference and its latency. The bridge timeout covers both stages.
 - Environment: `LISTEN_HOST`, `LISTEN_PORT`, `UPSTREAM`, `API_KEY`,
   `ALLOW_UNAUTHENTICATED`, `THINKING_DEFAULT`, `MAX_TOKENS`, `TIMEOUT`,
   `MAX_BODY`.

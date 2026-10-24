@@ -47,7 +47,7 @@ body:
     attributes:
       label: Overall outcome
       options:
-        - all checks pass (chat, long-prompt, tools)
+        - all supported checks pass (tools may be SKIP on the vendor runtime)
         - works partially (some checks fail)
         - fails completely
     validations:
@@ -56,7 +56,7 @@ body:
     id: output
     attributes:
       label: Output of `ugos-llm test` (and anything else relevant)
-      description: Paste the PASS/FAIL block and, if it exists, the report block.
+      description: Paste the PASS/FAIL/SKIP block and, if it exists, the report block.
       render: text
     validations:
       required: true

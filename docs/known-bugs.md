@@ -118,6 +118,10 @@ the OpenAI SDK) never notice.
 - **Never `pkill` a llama-server.** The gateway keeps dead unix-socket
   references, answers `connection refused`, spawns a second gateway that
   loses the port fight, and only a reboot recovers. Ask us how we know.
+- The CLI refuses `install --force` and `remove` while that model is loaded.
+  Otherwise a forced install could test the old process, and removing the UI
+  card would take away the clean stop control. Disable the model in Model
+  Manager (or reboot), then retry.
 
 ---
 

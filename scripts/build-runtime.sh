@@ -59,6 +59,7 @@ git fetch --quiet --depth 1 origin "$COMMIT"
 git checkout --quiet FETCH_HEAD
 
 echo "=== [3/6] configure + build ==="
+# shellcheck source=/dev/null
 source /opt/intel/oneapi/setvars.sh > /dev/null 2>&1 || true
 export SYCL_PROGRAM_COMPILE_OPTIONS="-cl-fp32-correctly-rounded-divide-sqrt"
 cmake -B build \
@@ -79,9 +80,9 @@ rm -rf "$OUT"          # stale libraries from a previous run must not survive
 mkdir -p "$OUT"
 cp -P build/bin/llama-server "$OUT/"
 find build -name "*.so*" -exec cp -P {} "$OUT/" \;
-CMPLR=$(ls -d /opt/intel/oneapi/compiler/20*/lib | head -1)
-MKL=$(ls -d /opt/intel/oneapi/mkl/20*/lib | head -1)
-UMF=$(ls -d /opt/intel/oneapi/umf/*/lib | head -1)
+CMPLR=$(find /opt/intel/oneapi/compiler -mindepth 2 -maxdepth 2 -type d -name lib -print -quit)
+MKL=$(find /opt/intel/oneapi/mkl -mindepth 2 -maxdepth 2 -type d -name lib -print -quit)
+UMF=$(find /opt/intel/oneapi/umf -mindepth 2 -maxdepth 2 -type d -name lib -print -quit)
 cp -P "$CMPLR"/libur_adapter_level_zero.so* "$CMPLR"/libur_adapter_opencl.so* "$OUT/"
 cp -P "$UMF"/libumf.so* "$OUT/"
 cp -P "$MKL"/libmkl_sycl_blas.so* "$MKL"/libmkl_intel_ilp64.so* \
@@ -89,7 +90,7 @@ cp -P "$MKL"/libmkl_sycl_blas.so* "$MKL"/libmkl_intel_ilp64.so* \
 
 echo "=== [5/6] ldd closure — unresolved is a hard error ==="
 GLIBC_RE='^(libc|libm|libdl|libpthread|librt|libresolv|libnsl|libutil|ld-linux|libanl|libnss)'
-for pass in 1 2 3; do
+for _ in 1 2 3; do
   for f in "$OUT"/llama-server "$OUT"/*.so*; do
     [ -f "$f" ] || continue
     ldd "$f" 2>/dev/null | awk '/=>/ {print $1, $3}' | while read -r name path; do

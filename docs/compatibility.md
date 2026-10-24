@@ -151,9 +151,14 @@ python3 ugos-llm.py test <Name>              # chat + long-prompt + tools
 python3 ugos-llm.py test <Name> --vision     # if you installed a projector
 ```
 
-The `test` long-prompt check is specifically designed to expose the ub-4096
-class of corruption; if it passes together with the tool check, the model is
-genuinely usable including Uliya's intelligent commands.
+The `test` long-prompt check exposes the ub-4096 class of corruption and
+requires the correct year (`1987`), not merely fluent output. The tool check
+requires `get_system_info` with `category="storage"`; prose or a malformed or
+different call is not a pass. On the vendor runtime, which lacks reliable
+native tool calling, no call is reported as `SKIP` with a bridge hint rather
+than a false PASS or a new failure. On upstream runtimes it is a `FAIL`.
+`SKIP` does not qualify native tools or Uliya intelligent commands; test
+those separately.
 
 `test` ends with a ready-made **report block** (model, architecture, file
 size, ub, per-check results, device). Paste it into a

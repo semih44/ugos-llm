@@ -108,6 +108,10 @@ model's server process.
   - **killing a llama-server corrupts the gateway** (it keeps dead socket
     references and returns `connection refused` until reboot — and its
     respawned twin fights over the port). Never do this.
+- `ugos-llm.py install --force` and `remove` therefore refuse to touch a
+  loaded model before any download, catalog or file change. Disable it in
+  Model Manager (or reboot) first; a fresh or unloaded model still needs no
+  reload before first use.
 
 ## Where the logs are
 
