@@ -6,17 +6,13 @@ on:
 
 jobs:
   test:
-    # setup-python has no 3.9 builds for the ubuntu-26.04 latest image.
+    # Keep the Python 3.11 test environment fixed rather than chasing latest.
     runs-on: ubuntu-24.04
-    strategy:
-      matrix:
-        # 3.9 is roughly what older UGOS images ship; 3.12 is current.
-        python-version: ["3.9", "3.12"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.11"
       - name: Byte-compile (syntax check)
         run: python -m compileall -q ugos-llm.py openai-bridge/proxy.py tests
       - name: Unit tests
@@ -29,12 +25,12 @@ jobs:
           done
 
   lint:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.11"
       - name: Shell syntax
         run: bash -n scripts/build-runtime.sh scripts/build-runtime-vulkan.sh
       - name: Shellcheck

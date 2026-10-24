@@ -72,7 +72,8 @@ and you can stop after the first:
 
 The five-minute path, on the runtime your NAS already has. The tool always
 **executes on the NAS** (it needs local paths and the loopback-only gateway) —
-but you drive it from any OS over SSH. Enable SSH in UGOS first:
+but you drive it from any OS over SSH. Python 3.11.x is the project standard
+for the CLI and its helper/bridge containers. Enable SSH in UGOS first:
 Control Panel → Terminal.
 
 On the NAS (SSH session, user in the `docker` group — or root):
@@ -316,7 +317,7 @@ This runs with root privileges on your NAS, so it is built defensively:
 - **Loaded models are left alone.** `install --force` and `remove` refuse to
   touch a model whose server is loaded, before any download, catalog or file
   change. Disable it in Model Manager (or reboot) first.
-- **Versioned helper images** (`alpine:3.20`, `python:3.12-alpine`) instead of
+- **Versioned helper images** (`alpine:3.20`, `python:3.11-alpine`) instead of
   moving `latest` tags. Version tags are still mutable — for bit-for-bit
   reproducibility override them with digests via `UGOS_LLM_IMG_BUSYBOX` /
   `UGOS_LLM_IMG_PYTHON`.
@@ -337,7 +338,7 @@ detected and **rejected** rather than half-installed. Pick a single-file quant.
 ## Development
 
 ```bash
-python3 -m unittest discover -s tests -v    # 171 unit tests, stdlib only
+python3 -m unittest discover -s tests -v    # 175 unit tests, stdlib only
 ```
 
 The suite needs neither root nor Docker — every privileged call is faked —
@@ -345,7 +346,7 @@ but it does need a POSIX system (Linux or macOS): the CLI itself relies on
 `fcntl` locks and POSIX rename semantics, because it only ever runs on the
 NAS. Windows is not supported, not even for running the tests.
 
-CI runs the suite on Python 3.9 and 3.12, a pinned ruff lint, and bash
+CI runs the suite on Python 3.11, a pinned ruff lint, and bash
 syntax/Shellcheck on the runtime recipes. The risky parts — name validation,
 GGUF header parsing, architecture rules, split detection, atomic
 install/rollback, loaded-model guards, strict acceptance verdicts, the

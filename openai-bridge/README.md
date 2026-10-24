@@ -24,7 +24,7 @@ JSON-schema instruction, the answer is parsed and re-wrapped as a synthetic
 # add to any docker-compose.yml
 services:
   llm-bridge:
-    image: docker.io/library/python:3.12-alpine
+    image: docker.io/library/python:3.11-alpine
     container_name: llm-bridge
     restart: unless-stopped
     network_mode: host          # needed to reach 127.0.0.1:62891
@@ -95,7 +95,7 @@ docker run -d --name ugos-llm-bridge --restart unless-stopped \
   -e LISTEN_PORT=11436 \
   -e API_KEY="$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))')" \
   -e MAX_TOKENS=4096 \
-  python:3.12-alpine python3 /bridge/proxy.py
+  python:3.11-alpine python3 /bridge/proxy.py
 ```
 
 Run this as a **second** instance rather than re-purposing a container your

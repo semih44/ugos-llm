@@ -51,7 +51,7 @@ services:
   # The openai-bridge (REQUIRED for AI suggestions): Paperless uses forced
   # tool-calling, which the UGOS gateway cannot handle. See ../../openai-bridge/
   llm-bridge:
-    image: docker.io/library/python:3.12-alpine
+    image: docker.io/library/python:3.11-alpine
     container_name: paperless-llm-bridge
     restart: unless-stopped
     network_mode: host

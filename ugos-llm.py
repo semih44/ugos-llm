@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """ugos-llm — run your own LLMs on UGREEN NASync AI NAS devices.
 
-Single-file CLI, Python 3 stdlib only. Run it ON the NAS (via SSH).
+Single-file CLI, Python 3.11 stdlib only. Run it ON the NAS (via SSH).
 
   check    pre-flight a Hugging Face GGUF repo (no download)
   install  download + configure + register a model
@@ -54,7 +54,7 @@ AICONSOLE_DB = "/volume1/@appstore/com.ugreen.aiconsole/db/aiconsole.db"
 IMG_BUSYBOX = os.environ.get("UGOS_LLM_IMG_BUSYBOX",
                              "docker.io/library/alpine:3.20")
 IMG_PYTHON = os.environ.get("UGOS_LLM_IMG_PYTHON",
-                            "docker.io/library/python:3.12-alpine")
+                            "docker.io/library/python:3.11-alpine")
 
 # Catalog rows created by this tool are marked with this release_id so that
 # `remove`/`ui remove` can never delete a vendor row.
