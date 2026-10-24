@@ -843,5 +843,52 @@ class TestDockerPath(unittest.TestCase):
             ug._priv_rmtree(".M.old")
 
 
+class TestToolResultHint(unittest.TestCase):
+    """TOOL_RESULT_HINT reaches the model only in the answer step after a
+    tool result — never in the step where it decides whether to call one,
+    and never through the emulated (forced-tool) path."""
+    tool_turn = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "lights?"},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "1", "type": "function",
+             "function": {"name": "alpha", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "1", "content": "{\"on\": []}"}]
+
+    def setUp(self):
+        self._orig = px.TOOL_RESULT_HINT
+        px.TOOL_RESULT_HINT = "Answer briefly."
+
+    def tearDown(self):
+        px.TOOL_RESULT_HINT = self._orig
+
+    def test_appended_after_tool_result(self):
+        data, note, plan = rw({"model": "m", "messages": self.tool_turn,
+                               "tools": [TOOL_A], "tool_choice": "auto"})
+        self.assertIsNone(plan)
+        self.assertEqual(len(data["messages"]), len(self.tool_turn) + 1)
+        self.assertEqual(data["messages"][-1],
+                         {"role": "user", "content": "Answer briefly."})
+        self.assertIn("hint", note)
+
+    def test_untouched_when_user_speaks_last(self):
+        data, note, _ = rw({"model": "m", "messages": self.tool_turn[:2],
+                            "tools": [TOOL_A], "tool_choice": "auto"})
+        self.assertEqual(data["messages"], self.tool_turn[:2])
+        self.assertNotIn("hint", note)
+
+    def test_untouched_when_unset(self):
+        px.TOOL_RESULT_HINT = ""
+        data, note, _ = rw({"model": "m", "messages": self.tool_turn})
+        self.assertEqual(data["messages"], self.tool_turn)
+        self.assertNotIn("hint", note)
+
+    def test_not_for_emulated_requests(self):
+        data, _, plan = rw({"model": "m", "messages": self.tool_turn,
+                            "tools": [TOOL_A], "tool_choice": "required"})
+        self.assertEqual(plan[0], "single")
+        self.assertNotIn("Answer briefly.", json.dumps(data["messages"]))
+
+
 if __name__ == "__main__":
     unittest.main()

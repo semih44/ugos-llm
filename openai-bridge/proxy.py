@@ -39,6 +39,16 @@ Configuration (env):
                 Do not. It publishes an open LLM endpoint to your network.
   THINKING_DEFAULT on|off|empty. Client kwargs and reasoning_effort win;
                 empty leaves plain requests alone and emulated tools off.
+  TOOL_RESULT_HINT default empty. When set, appended as a final user
+                message to every plain chat request whose last message is
+                a tool result — the answer step of a tool-calling loop.
+                Answer-style guidance ("short, plain text, German") belongs
+                here, not in the system prompt: placed before the tool
+                definitions it makes a small model announce or decline
+                instead of calling the tool (Qwen3.5-9B behind Home
+                Assistant, thinking off: 7/10 tool calls with such a
+                system prompt, 10/10 without). Added per request, never
+                stored by the client; the prompt-cache prefix stays intact.
   MAX_TOKENS    default 1024   (hard cap, clamps larger client values)
   TIMEOUT       default 570    (seconds; keep below your client timeout)
   MAX_BODY      default 33554432 (32 MiB request limit)
@@ -104,6 +114,9 @@ ALLOW_UNAUTHENTICATED = (os.environ.get("ALLOW_UNAUTHENTICATED", "").lower()
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "1024"))
 TIMEOUT = int(os.environ.get("TIMEOUT", "570"))
 MAX_BODY = int(os.environ.get("MAX_BODY", str(32 * 1024 * 1024)))
+# Trailing user message for the answer step after a tool result (see the
+# module docstring); empty = off.
+TOOL_RESULT_HINT = os.environ.get("TOOL_RESULT_HINT", "")
 
 SINGLE_INSTR = (
     "\n\nRespond with EXACTLY ONE valid JSON object conforming to this JSON "
@@ -339,6 +352,20 @@ def emulated_thinking(data):
     return isinstance(kwargs, dict) and kwargs.get("enable_thinking") is True
 
 
+def append_tool_result_hint(data):
+    """Append TOOL_RESULT_HINT as a trailing user message when the request
+    is the answer step after a tool call (its last message is a tool
+    result). Returns True if the request was changed."""
+    msgs = data.get("messages")
+    if not TOOL_RESULT_HINT or not isinstance(msgs, list) or not msgs:
+        return False
+    last = msgs[-1]
+    if not isinstance(last, dict) or last.get("role") != "tool":
+        return False
+    msgs.append({"role": "user", "content": TOOL_RESULT_HINT})
+    return True
+
+
 def rewrite(body, path):
     """Returns (new_body, note, plan_or_None)."""
     if not path.startswith("/v1/chat/completions"):
@@ -350,12 +377,16 @@ def rewrite(body, path):
     p = plan(data)
     if p is None:
         note = "tools-passthrough" if data.get("tools") else "-"
+        changed = append_tool_result_hint(data)
+        if changed:
+            note += ",hint"
         kw = thinking_kwargs(data)
         if kw is not None:
             data["chat_template_kwargs"] = kw
-            state = "think" if kw["enable_thinking"] else "nothink"
-            return (json.dumps(data).encode("utf-8"),
-                    note + f",{state}", None)
+            note += ",think" if kw["enable_thinking"] else ",nothink"
+            changed = True
+        if changed:
+            return json.dumps(data).encode("utf-8"), note, None
         return body, note, None
 
     instr, note = tool_prompt(p)

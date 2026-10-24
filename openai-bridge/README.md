@@ -168,6 +168,16 @@ with 501).
   stages: analysis with thinking, then JSON with thinking disabled. This
   reserves JSON budget and keeps the OpenAI response unchanged, but adds a
   second inference and its latency. The bridge timeout covers both stages.
+- `TOOL_RESULT_HINT` (default empty) is appended as a final `user` message
+  whenever a plain chat request ends with a `tool` result — the answer step
+  of a tool-calling loop, e.g. Home Assistant's LiteLLM integration. Put
+  answer-style guidance there instead of the system prompt: measured on
+  Qwen3.5-9B with thinking off, a system prompt asking for short plain-text
+  German answers made the model announce ("I'll check…") or decline instead
+  of calling the tool in 3 of 10 home-state questions; without any custom
+  system prompt it called the tool 10/10. The hint is added per request
+  (the client never sees or stores it) and keeps the prompt-cache prefix
+  intact. Log note: `hint`.
 - Environment: `LISTEN_HOST`, `LISTEN_PORT`, `UPSTREAM`, `API_KEY`,
-  `ALLOW_UNAUTHENTICATED`, `THINKING_DEFAULT`, `MAX_TOKENS`, `TIMEOUT`,
-  `MAX_BODY`.
+  `ALLOW_UNAUTHENTICATED`, `THINKING_DEFAULT`, `TOOL_RESULT_HINT`,
+  `MAX_TOKENS`, `TIMEOUT`, `MAX_BODY`.
